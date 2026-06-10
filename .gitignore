@@ -2,3 +2,8 @@ __pycache__/
 .env
 .env.*
 tools/.env
+
+# Generated ontology builder / scout outputs
+hv_access/builder_runs/
+hv_access/scout*_run_*/
+hv_access/ontology_builder_*.yaml

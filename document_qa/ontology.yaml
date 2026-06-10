@@ -1,0 +1,216 @@
+name: document_qa
+description: "本地 MinerU Markdown 文档库问答。回答文档内容、某人/机构/关键词相关内容、出现位置、涉及事项时，应优先使用本领域 search_documents/read_document/prepare_answer_context，而不是通用 search 直接作答；通过按需检索和按需读取，为回答提供可追溯出处。"
+tool_preferences:
+  generic_search: fallback_only
+
+objects:
+  Document:
+    kind: entity
+    data_source: external_api
+    mutability: read_only
+    source:
+      type: resolver
+      resolver: document_index
+      id_field: document_id
+    summary: "一份 Markdown 文档，来自 documents_mineru 文档库"
+    description: "文档元数据。回答内容问题时优先使用 search_documents 检索片段，再用 read_document 读取更大上下文。"
+    properties:
+      document_id: {type: str, required: true, description: "稳定文档ID"}
+      title: {type: str, description: "文档标题"}
+      path: {type: str, description: "相对项目根目录的 Markdown 路径"}
+      category: {type: str, description: "由目录推断的类别路径"}
+      agency: {type: str, description: "由目录或正文推断的机关/来源"}
+      doc_type: {type: str, description: "由目录或标题推断的文档类型"}
+      date_text: {type: str, description: "由路径或标题提取的日期文本"}
+      char_count: {type: int, description: "正文字符数"}
+
+  DocumentChunk:
+    kind: entity
+    data_source: external_api
+    mutability: read_only
+    source:
+      type: resolver
+      resolver: document_index
+      id_field: chunk_id
+    summary: "文档片段，用于问答证据引用"
+    description: "文档按标题/段落切分后的片段。chunk 仅是证据载体，不要把单个片段当作全文。"
+    properties:
+      chunk_id: {type: str, required: true, description: "稳定片段ID"}
+      document_id: {type: str, description: "所属文档ID"}
+      title: {type: str, description: "所属文档标题"}
+      path: {type: str, description: "所属文档路径"}
+      category: {type: str, description: "文档类别"}
+      heading: {type: str, description: "片段所在标题层级"}
+      content: {type: str, description: "片段正文"}
+      image_refs: {type: str, description: "片段中出现的图片路径，逗号分隔"}
+
+  DocumentRelation:
+    kind: entity
+    data_source: external_api
+    mutability: read_only
+    source:
+      type: resolver
+      resolver: document_index
+      id_field: relation_id
+    summary: "文档之间的可解释关系"
+    description: "由标题引用、文种流程、同系列、核心短语重合或 embedding 相似构建的文档关系。硬关系可作为事实性线索，软关系只表示主题相近。"
+    properties:
+      relation_id: {type: str, required: true, description: "稳定关系ID"}
+      source_document_id: {type: str, description: "源文档ID"}
+      source_title: {type: str, description: "源文档标题"}
+      source_path: {type: str, description: "源文档路径"}
+      target_document_id: {type: str, description: "目标文档ID"}
+      target_title: {type: str, description: "目标文档标题"}
+      target_path: {type: str, description: "目标文档路径"}
+      relation_type: {type: str, description: "关系类型，如 cites、feedback_to、request_for、same_series、topically_related、semantically_related"}
+      confidence: {type: float, description: "关系置信度，0到1"}
+      evidence: {type: str, description: "关系证据说明"}
+      method: {type: str, description: "构建方法，如 rule、lexical_profile、embedding"}
+      metadata: {type: str, description: "关系附加信息 JSON"}
+
+links:
+  document_chunks:
+    source: Document
+    target: DocumentChunk
+    join: {source_key: document_id, target_key: document_id}
+    description: "文档包含的片段"
+    link_type: contains
+    cardinality: 1..n
+
+  document_relation_source:
+    source: Document
+    target: DocumentRelation
+    join: {source_key: document_id, target_key: source_document_id}
+    description: "文档作为关系源"
+    link_type: relates
+    cardinality: 1..n
+
+  document_relation_target:
+    source: DocumentRelation
+    target: Document
+    join: {source_key: target_document_id, target_key: document_id}
+    description: "关系指向的目标文档"
+    link_type: relates
+    cardinality: n..1
+
+functions:
+  search_documents:
+    summary: "检索本地文档库，返回轻量证据片段"
+    description: "按关键词、标题、类别、机关、文档类型等条件检索 documents_mineru 中的 Markdown 文档片段。"
+    usage_prompt: "回答文档库事实性问题前可调用本工具做初步召回。用户询问某个人名、机构名、事项名或关键词的“相关内容、涉及哪些文档、出现在哪里、有哪些提及”时，优先调用本工具而不是通用 search。对于汇总、梳理、政策要求、年度范围、多文档综合类问题，优先调用 prepare_answer_context。注意：本工具只返回片段和候选文档，不能代替原文阅读；当用户问“相关内容/具体内容/上下文/事项经过/汇总相关内容”时，调用本工具后必须继续调用 read_document 读取代表性命中 chunk_id 或 document_id，至少核对高排名命中文档后再回答。回答中必须引用 title/path/heading 或 chunk_id。"
+    function_type: lookup
+    involves_objects: [Document, DocumentChunk]
+    params:
+      query: {type: str, description: "用户问题或关键词"}
+      category: {type: str, description: "可选，按类别路径过滤，如 14类/报告 或 通知抬头文件/水务局", default: ""}
+      agency: {type: str, description: "可选，按机关/来源过滤", default: ""}
+      doc_type: {type: str, description: "可选，按文档类型过滤，如 报告、通知", default: ""}
+      limit: {type: int, description: "返回片段数量，默认8", default: 8}
+      rerank: {type: bool, description: "是否启用文档级 query profile 重排，适合主题检索/找相关材料，默认 false", default: false}
+      debug: {type: bool, description: "是否返回文档级重排评分拆解，仅 rerank=true 时有意义，默认 false", default: false}
+
+  read_document:
+    summary: "按文档路径、文档ID或片段ID读取文档上下文"
+    description: "读取完整文档、某个标题下内容，或某个 chunk 前后片段，并返回本篇文档的时间属性与抽取质量。用于核对证据和补充上下文。"
+    usage_prompt: "当 search_documents 的片段不够完整、需要查看上下文或全文时调用。对人名、机构名、事项名或关键词的相关内容检索，若需要回答具体内容、上下文、事项经过或汇总，应使用命中的 chunk_id、document_id 或 path 调用本工具核对原文后再回答；不要只根据搜索片段作答。不要无理由读取大量全文。若此前已调用 prepare_answer_context，read_document 只能补充单篇证据，不能覆盖 prepare_answer_context.temporal_coverage 与 strict_answer_constraints。"
+    function_type: lookup
+    involves_objects: [Document, DocumentChunk]
+    params:
+      path: {type: str, description: "文档路径，可选", default: ""}
+      document_id: {type: str, description: "文档ID，可选", default: ""}
+      chunk_id: {type: str, description: "片段ID，可选；提供后默认读取前后文", default: ""}
+      heading: {type: str, description: "标题关键词，可选", default: ""}
+      max_chars: {type: int, description: "最大返回字符数，默认6000", default: 6000}
+
+  list_documents:
+    summary: "列出文档库中的文档元数据"
+    description: "按类别、机关、文档类型或标题关键词列出文档。"
+    function_type: lookup
+    involves_objects: [Document]
+    params:
+      category: {type: str, description: "可选，类别过滤", default: ""}
+      agency: {type: str, description: "可选，机关过滤", default: ""}
+      doc_type: {type: str, description: "可选，文档类型过滤", default: ""}
+      title_like: {type: str, description: "可选，标题包含文本", default: ""}
+      limit: {type: int, description: "返回数量，默认20", default: 20}
+
+  find_related_documents:
+    summary: "根据剔除目录中的 seed 文档寻找正式文档库中的相关材料"
+    description: "读取被排除目录（如 documents_mineru/其他）中的 seed 文档，抽取主题词，并检索正式文档索引中的相关文档片段。seed 文档不进入主索引。"
+    usage_prompt: "当用户要求找与“其他”等剔除目录中文档相关的正式文档时使用。seed 文档只能作为检索线索，不能作为最终回答出处；最终回答只能引用 hits 中的正式文档 title/path/heading/chunk_id。"
+    function_type: lookup
+    involves_objects: [Document, DocumentChunk]
+    params:
+      seed_path: {type: str, description: "seed Markdown 路径，必须位于剔除目录中；可选", default: ""}
+      seed_title: {type: str, description: "seed 标题关键词；未提供 seed_path 时用于匹配剔除目录中的文档", default: ""}
+      query_hint: {type: str, description: "用户补充的相关性方向或关键词，可选", default: ""}
+      limit: {type: int, description: "返回正式文档片段数量，默认10", default: 10}
+      debug: {type: bool, description: "是否返回相关性评分拆解，默认 false", default: false}
+
+  build_document_kb:
+    summary: "构建文档关系知识库"
+    description: "基于正式文档库构建 document_relations：优先抽取引用、反馈、请示/批复、附件、同系列等可解释硬关系，并可补充核心短语/embedding 的软主题关系。"
+    usage_prompt: "只有当用户明确要求构建/刷新文档关系 KB，或文档索引更新后需要刷新关系时才调用。普通问答不要频繁重建。"
+    function_type: lookup
+    involves_objects: [Document, DocumentRelation]
+    params:
+      force: {type: bool, description: "是否清空并重建关系表，默认 true", default: true}
+      include_soft: {type: bool, description: "是否包含核心短语和 embedding 软关系，默认 true", default: true}
+
+  find_document_relations:
+    summary: "查询某份正式文档的文档关系"
+    description: "按 path、document_id 或 title_like 定位正式文档，返回它作为源或目标参与的文档关系。"
+    usage_prompt: "当用户问某份文档的前后件、附件、反馈、引用、同系列或相关材料时使用。relation_type 为空时返回全部关系。"
+    function_type: lookup
+    involves_objects: [Document, DocumentRelation]
+    params:
+      path: {type: str, description: "正式文档路径，可选", default: ""}
+      document_id: {type: str, description: "正式文档ID，可选", default: ""}
+      title_like: {type: str, description: "正式文档标题关键词，可选", default: ""}
+      relation_type: {type: str, description: "可选，关系类型过滤，如 feedback_to、request_for、shared_reference、topically_related", default: ""}
+      direction: {type: str, description: "source、target 或 both，默认 both", default: "both"}
+      limit: {type: int, description: "返回关系数量，默认20", default: 20}
+
+  expand_document_context:
+    summary: "扩展某份正式文档的上下文材料"
+    description: "围绕一份正式文档，把关系按类型分组，并给出推荐阅读的相关文档。适合问答前收集上下游材料。"
+    usage_prompt: "当用户需要围绕某份文档理解事项来龙去脉、查找相关材料包或构建回答上下文时使用。软关系只作为补充候选，关键事实仍需 read_document 核对。"
+    function_type: lookup
+    involves_objects: [Document, DocumentRelation]
+    params:
+      path: {type: str, description: "正式文档路径，可选", default: ""}
+      document_id: {type: str, description: "正式文档ID，可选", default: ""}
+      title_like: {type: str, description: "正式文档标题关键词，可选", default: ""}
+      relation_types: {type: str, description: "可选，逗号分隔的关系类型过滤", default: ""}
+      limit: {type: int, description: "返回关系/推荐文档数量，默认20", default: 20}
+
+  prepare_answer_context:
+    summary: "为多文档综合问答准备证据材料包"
+    description: "围绕用户问题进行全库召回、文档去重排序、KB 关系扩展、核心文档读取，并返回时间属性、抽取质量、证据内容和回答提示。该工具不依赖目录分类，适合平铺文档库。"
+    usage_prompt: "当用户要求汇总、梳理、总结、比较、归纳政策要求、按时间范围查找材料、或需要跨多篇文档综合回答时，优先调用本工具。回答必须基于 documents[].content 综合；先看 strict_answer_constraints、temporal_coverage、synthesis_outline 和 evidence_outline，不能声称覆盖 found_years 之外的年份。文档问答场景下，不要按命中文档逐篇堆摘要；若 synthesis_outline.recommended_answer_sections 非空，应优先把这些 section 作为一级归纳框架，因为它们由问题意图、标题/小节结构和跨文档证据分布生成；再把多篇文档证据归并到相应维度下。若多篇文档支持同一结论，应合并表述并列代表性出处；若证据之间适用对象、时间或口径不同，应说明差异。若 missing_years 或 quality_notes 提示覆盖不足/质量低，必须说明限制。"
+    function_type: lookup
+    involves_objects: [Document, DocumentChunk, DocumentRelation]
+    params:
+      query: {type: str, description: "用户原始问题或综合检索意图"}
+      limit_docs: {type: int, description: "读取核心文档数量，默认6，最多12", default: 6}
+      max_chars_per_doc: {type: int, description: "每篇核心文档最多读取字符数，默认4000", default: 4000}
+      include_relations: {type: bool, description: "是否使用文档 KB 关系扩展候选材料，默认 true", default: true}
+      debug: {type: bool, description: "是否返回更多检索调试信息，默认 false", default: false}
+
+  rebuild_document_index:
+    summary: "重建本地文档索引"
+    description: "扫描 documents_mineru/**/*.md 并重建 SQLite/FTS 索引。文档库更新后使用。"
+    usage_prompt: "只有当用户明确要求刷新/重建文档索引，或检索结果提示索引不存在/过期时才调用。"
+    function_type: lookup
+    involves_objects: [Document, DocumentChunk]
+    params:
+      force: {type: bool, description: "是否强制重建，默认 true", default: true}
+
+  rebuild_document_embeddings:
+    summary: "重建文档库语义向量索引"
+    description: "为已建索引的文档片段构建 embedding 向量，用于补足口语化、概念化问题的语义召回。支持 OpenAI-compatible 接口或本地 sentence-transformers 模型；本地模式只使用已缓存模型，不自动下载。"
+    usage_prompt: "只有当用户明确要求启用/刷新语义检索，或配置 embedding 后需要构建向量索引时才调用。普通文档更新先调用 rebuild_document_index。"
+    function_type: lookup
+    involves_objects: [DocumentChunk]
+    params:
+      force: {type: bool, description: "是否强制重建所有片段向量，默认 false；false 时只更新缺失或文本变化的向量", default: false}
