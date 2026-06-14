@@ -28,6 +28,7 @@ def register(registry: FunctionRegistry, store: ObjectRepository, ontology: Onto
             doc_type=kw.get("doc_type", "") or "",
             limit=kw.get("limit", 8) or 8,
             rerank=kw.get("rerank", False),
+            semantic=kw.get("semantic", False),
             debug=kw.get("debug", False),
         ),
         "read_document": lambda **kw: index.read_document(
@@ -80,6 +81,7 @@ def register(registry: FunctionRegistry, store: ObjectRepository, ontology: Onto
         "rebuild_document_index": lambda **kw: index.rebuild(
             force=kw.get("force", True),
         ),
+        "sync_document_index": lambda **kw: index.sync(),
         "rebuild_document_embeddings": lambda **kw: index.rebuild_embeddings(
             force=kw.get("force", False),
         ),

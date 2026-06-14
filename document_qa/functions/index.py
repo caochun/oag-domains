@@ -244,6 +244,80 @@ class DocumentIndex:
             }
         return result
 
+    def sync(self) -> dict[str, Any]:
+        """Incrementally synchronize the SQLite index with the markdown corpus."""
+        if not self.paths.index_path.exists():
+            return self.rebuild(force=True)
+
+        md_files = self._markdown_files()
+        current_by_path = {
+            path.relative_to(self.paths.repo_root).as_posix(): path
+            for path in md_files
+        }
+
+        with self._connect() as conn:
+            self._init_schema(conn)
+            existing_rows = conn.execute(
+                "select document_id, path, file_mtime from documents"
+            ).fetchall()
+            existing_by_path = {row["path"]: row for row in existing_rows}
+
+            deleted_paths = sorted(set(existing_by_path) - set(current_by_path))
+            upsert_paths = []
+            unchanged = 0
+            for rel_path, path in sorted(current_by_path.items()):
+                row = existing_by_path.get(rel_path)
+                if not row:
+                    upsert_paths.append((rel_path, path, "added"))
+                    continue
+                if abs(float(row["file_mtime"] or 0.0) - path.stat().st_mtime) > 1e-6:
+                    upsert_paths.append((rel_path, path, "updated"))
+                else:
+                    unchanged += 1
+
+            deleted = 0
+            for rel_path in deleted_paths:
+                self._delete_document(conn, existing_by_path[rel_path]["document_id"])
+                deleted += 1
+
+            added = 0
+            updated = 0
+            chunks_upserted = 0
+            for _rel_path, path, action in upsert_paths:
+                doc, chunks = self._parse_document(path)
+                self._delete_document(conn, doc["document_id"])
+                self._insert_parsed_document(conn, doc, chunks)
+                chunks_upserted += len(chunks)
+                if action == "added":
+                    added += 1
+                else:
+                    updated += 1
+
+            if deleted or upsert_paths:
+                self._refresh_term_statistics(conn)
+
+            documents = conn.execute("select count(*) from documents").fetchone()[0]
+            chunks = conn.execute("select count(*) from chunks").fetchone()[0]
+
+        result = {
+            "status": "synced",
+            "documents": documents,
+            "chunks": chunks,
+            "added": added,
+            "updated": updated,
+            "deleted": deleted,
+            "unchanged": unchanged,
+            "chunks_upserted": chunks_upserted,
+            "corpus_root": str(self.paths.corpus_root),
+            "index_path": str(self.paths.index_path),
+        }
+        if self.embedding_config.enabled:
+            result["embeddings"] = {
+                "status": "not_synced",
+                "message": "如需同步语义向量，请调用 rebuild_document_embeddings(force=false)，它只会补缺失或文本变化的 chunk。",
+            }
+        return result
+
     def rebuild_embeddings(self, force: bool = False,
                            ensure_index: bool = True) -> dict[str, Any]:
         if ensure_index:
@@ -322,16 +396,24 @@ class DocumentIndex:
 
     def search(self, query: str, *, category: str = "", agency: str = "",
                doc_type: str = "", limit: int = 8,
-               rerank: bool = False, debug: bool = False) -> dict[str, Any]:
+               rerank: bool = False, semantic: bool = False,
+               debug: bool = False) -> dict[str, Any]:
         self.ensure()
         clean_query = (query or "").strip()
         limit = max(1, min(int(limit or 8), 30))
         rerank = coerce_bool(rerank)
+        semantic = coerce_bool(semantic)
         debug = coerce_bool(debug)
         filters, params = self._sql_filters(category=category, agency=agency, doc_type=doc_type)
 
         recall_limit = max(limit * 8, 30) if rerank and clean_query else limit
-        ranked_candidates = self._recall_chunks(clean_query, filters, params, limit=recall_limit)
+        ranked_candidates = self._recall_chunks(
+            clean_query,
+            filters,
+            params,
+            limit=recall_limit,
+            semantic=semantic,
+        )
         if rerank and clean_query:
             profile = self._build_query_profile(clean_query)
             recall_hits = ranked_candidates[:recall_limit]
@@ -340,6 +422,7 @@ class DocumentIndex:
                 "query": clean_query,
                 "filters": compact_dict({"category": category, "agency": agency, "doc_type": doc_type}),
                 "rerank": "document_level_query_profile",
+                "semantic": semantic,
                 "query_terms": profile[:12],
                 "count": len(hits),
                 "hits": hits,
@@ -354,6 +437,7 @@ class DocumentIndex:
         return {
             "query": clean_query,
             "filters": compact_dict({"category": category, "agency": agency, "doc_type": doc_type}),
+            "semantic": semantic,
             "count": len(hits),
             "hits": hits,
         }
@@ -1066,6 +1150,111 @@ class DocumentIndex:
             """
         )
 
+    def _delete_document(self, conn: sqlite3.Connection, document_id: str) -> None:
+        chunk_ids = [
+            row["chunk_id"]
+            for row in conn.execute(
+                "select chunk_id from chunks where document_id = ?",
+                (document_id,),
+            ).fetchall()
+        ]
+        if chunk_ids:
+            conn.executemany(
+                "delete from chunk_embeddings where chunk_id = ?",
+                [(chunk_id,) for chunk_id in chunk_ids],
+            )
+            conn.executemany(
+                "delete from chunks_fts where chunk_id = ?",
+                [(chunk_id,) for chunk_id in chunk_ids],
+            )
+        conn.execute("delete from chunks where document_id = ?", (document_id,))
+        conn.execute("delete from document_terms where document_id = ?", (document_id,))
+        conn.execute("delete from document_metadata where document_id = ?", (document_id,))
+        conn.execute(
+            """
+            delete from document_relations
+            where source_document_id = ? or target_document_id = ?
+            """,
+            (document_id, document_id),
+        )
+        conn.execute("delete from documents where document_id = ?", (document_id,))
+
+    def _insert_parsed_document(self, conn: sqlite3.Connection,
+                                doc: dict[str, Any],
+                                chunks: list[dict[str, Any]]) -> None:
+        conn.execute(
+            """
+            insert or replace into documents
+            (document_id, path, title, category, agency, doc_type, date_text, file_mtime, char_count)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                doc["document_id"], doc["path"], doc["title"], doc["category"],
+                doc["agency"], doc["doc_type"], doc["date_text"], doc["file_mtime"],
+                doc["char_count"],
+            ),
+        )
+        for chunk in chunks:
+            conn.execute(
+                """
+                insert or replace into chunks
+                (chunk_id, document_id, ordinal, heading, content, image_refs, char_start)
+                values (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    chunk["chunk_id"], chunk["document_id"], chunk["ordinal"],
+                    chunk["heading"], chunk["content"], chunk["image_refs"],
+                    chunk["char_start"],
+                ),
+            )
+            conn.execute(
+                """
+                insert into chunks_fts
+                (chunk_id, document_id, title, category, heading, content_tokens, content)
+                values (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    chunk["chunk_id"], chunk["document_id"], doc["title"],
+                    doc["category"], chunk["heading"], tokenize_for_search(chunk["content"]),
+                    chunk["content"],
+                ),
+            )
+        weights = collect_document_term_weights(doc, chunks)
+        for term, term_weight in top_weighted_terms(weights, limit=30):
+            conn.execute(
+                """
+                insert or replace into document_terms
+                (document_id, term, term_weight, doc_freq, idf, score)
+                values (?, ?, ?, 0, 0.0, ?)
+                """,
+                (doc["document_id"], term, term_weight, term_weight),
+            )
+
+    def _refresh_term_statistics(self, conn: sqlite3.Connection) -> None:
+        total_documents = conn.execute("select count(*) from documents").fetchone()[0]
+        conn.execute("delete from term_stats")
+        rows = conn.execute(
+            """
+            select term, count(distinct document_id) as doc_freq
+            from document_terms
+            group by term
+            """
+        ).fetchall()
+        for row in rows:
+            idf = compute_idf(total_documents, int(row["doc_freq"]))
+            conn.execute(
+                "insert or replace into term_stats (term, doc_freq, idf) values (?, ?, ?)",
+                (row["term"], row["doc_freq"], idf),
+            )
+            conn.execute(
+                """
+                update document_terms
+                set doc_freq = ?, idf = ?, score = term_weight * ?
+                where term = ?
+                """,
+                (row["doc_freq"], idf, idf, row["term"]),
+            )
+
     def _load_relation_documents(self, conn: sqlite3.Connection) -> list[dict[str, Any]]:
         rows = conn.execute(
             """
@@ -1518,7 +1707,8 @@ class DocumentIndex:
         return {row["term"]: float(row["idf"]) for row in rows}
 
     def _recall_chunks(self, query: str, filters: list[str],
-                       params: list[Any], limit: int) -> list[dict[str, Any]]:
+                       params: list[Any], limit: int,
+                       semantic: bool = False) -> list[dict[str, Any]]:
         candidates: dict[str, dict[str, Any]] = {}
         clean_query = (query or "").strip()
         limit = max(1, min(int(limit or 8), 240))
@@ -1569,8 +1759,9 @@ class DocumentIndex:
                     for row in conn.execute(token_sql, [*params, token_like, token_like, limit * 2]):
                         self._add_candidate(candidates, dict(row), 4.0, clean_query)
 
-                for row in self._semantic_recall_chunks(clean_query, filters, params, limit):
-                    self._add_semantic_candidate(candidates, row, clean_query)
+                if semantic:
+                    for row in self._semantic_recall_chunks(clean_query, filters, params, limit):
+                        self._add_semantic_candidate(candidates, row, clean_query)
             else:
                 sql = f"""
                     select c.*, d.title, d.path, d.category, d.agency, d.doc_type

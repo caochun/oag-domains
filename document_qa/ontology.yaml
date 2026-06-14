@@ -107,6 +107,7 @@ functions:
       doc_type: {type: str, description: "可选，按文档类型过滤，如 报告、通知", default: ""}
       limit: {type: int, description: "返回片段数量，默认8", default: 8}
       rerank: {type: bool, description: "是否启用文档级 query profile 重排，适合主题检索/找相关材料，默认 false", default: false}
+      semantic: {type: bool, description: "是否启用 embedding 语义召回；会扫描向量索引，适合关键词不明确或词法召回不足时使用，默认 false", default: false}
       debug: {type: bool, description: "是否返回文档级重排评分拆解，仅 rerank=true 时有意义，默认 false", default: false}
 
   read_document:
@@ -151,6 +152,7 @@ functions:
     summary: "构建文档关系知识库"
     description: "基于正式文档库构建 document_relations：优先抽取引用、反馈、请示/批复、附件、同系列等可解释硬关系，并可补充核心短语/embedding 的软主题关系。"
     usage_prompt: "只有当用户明确要求构建/刷新文档关系 KB，或文档索引更新后需要刷新关系时才调用。普通问答不要频繁重建。"
+    user_visible: false
     function_type: lookup
     involves_objects: [Document, DocumentRelation]
     params:
@@ -200,16 +202,27 @@ functions:
   rebuild_document_index:
     summary: "重建本地文档索引"
     description: "扫描 documents_mineru/**/*.md 并重建 SQLite/FTS 索引。文档库更新后使用。"
-    usage_prompt: "只有当用户明确要求刷新/重建文档索引，或检索结果提示索引不存在/过期时才调用。"
+    usage_prompt: "只有当用户明确要求全量刷新/重建文档索引，或索引结构损坏、切换整个语料目录时才调用。新增、删除或修改少量 Markdown 时优先调用 sync_document_index。"
+    user_visible: false
     function_type: lookup
     involves_objects: [Document, DocumentChunk]
     params:
       force: {type: bool, description: "是否强制重建，默认 true", default: true}
 
+  sync_document_index:
+    summary: "增量同步本地文档索引"
+    description: "扫描当前文档目录，与 SQLite 索引中的 path/file_mtime 对比，只新增、更新或删除变化的 Markdown 文档及其 chunks。不会全量重建；语义向量可随后调用 rebuild_document_embeddings(force=false) 增量补齐。"
+    usage_prompt: "当用户新增、删除、替换或清理少量 Markdown 文档后，优先调用本工具同步索引；不要为单篇变化调用 rebuild_document_index。若需要刷新文档关系 KB，再调用 build_document_kb。"
+    user_visible: false
+    function_type: lookup
+    involves_objects: [Document, DocumentChunk]
+    params: {}
+
   rebuild_document_embeddings:
     summary: "重建文档库语义向量索引"
     description: "为已建索引的文档片段构建 embedding 向量，用于补足口语化、概念化问题的语义召回。支持 OpenAI-compatible 接口或本地 sentence-transformers 模型；本地模式只使用已缓存模型，不自动下载。"
-    usage_prompt: "只有当用户明确要求启用/刷新语义检索，或配置 embedding 后需要构建向量索引时才调用。普通文档更新先调用 rebuild_document_index。"
+    usage_prompt: "只有当用户明确要求启用/刷新语义检索，或配置 embedding 后需要构建向量索引时才调用。普通文档更新先调用 sync_document_index，再用 force=false 增量补齐缺失或文本变化的向量；全量换模型时才用 force=true。"
+    user_visible: false
     function_type: lookup
     involves_objects: [DocumentChunk]
     params:
