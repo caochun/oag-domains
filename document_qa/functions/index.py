@@ -7,6 +7,7 @@ import os
 import re
 import sqlite3
 import struct
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,7 @@ DATE_RE = re.compile(
 )
 DOC_TYPE_WORDS = ("报告", "通知", "请示", "函", "纪要", "方案", "预案", "要点", "意见", "办法", "规则")
 DEFAULT_EXCLUDED_TOP_LEVEL_DIRS = {"其他"}
+DOCUMENT_KB_EXTRACTOR_VERSION = 2
 TERM_STOPWORDS = {
     "关于", "情况", "工作", "汇报", "报告", "通知", "文件", "批办", "有关",
     "进行", "开展", "推进", "建设", "年度", "落实", "印发", "一个", "我们",
@@ -139,18 +141,42 @@ class DocumentIndex:
 
     def ensure(self) -> dict[str, Any]:
         if not self.paths.index_path.exists():
-            return self.rebuild(force=True)
+            raise RuntimeError(
+                f"文档索引不存在: {self.paths.index_path}。"
+                "全量自动重建已禁用，请先恢复索引备份，或离线执行受控重建。"
+            )
         try:
             with self._connect() as conn:
                 indexed = conn.execute("select count(*) from documents").fetchone()[0]
             files = len(self._markdown_files())
             if indexed == 0 and files:
-                return self.rebuild(force=True)
+                raise RuntimeError(
+                    f"文档索引为空: {self.paths.index_path}。"
+                    "全量自动重建已禁用，请先恢复索引备份，或离线执行受控重建。"
+                )
             return {"status": "ready", "documents": indexed, "index_path": str(self.paths.index_path)}
-        except sqlite3.DatabaseError:
-            return self.rebuild(force=True)
+        except sqlite3.OperationalError as exc:
+            if "locked" in str(exc).lower():
+                raise RuntimeError(
+                    f"文档索引当前被其他任务写入锁定: {self.paths.index_path}。"
+                    "请稍后重试，或等待 KB/embedding 批处理完成。"
+                ) from exc
+            raise RuntimeError(
+                f"文档索引损坏或不可读: {self.paths.index_path}。"
+                "全量自动重建已禁用，请先恢复索引备份，或离线执行受控重建。"
+            ) from exc
+        except sqlite3.DatabaseError as exc:
+            raise RuntimeError(
+                f"文档索引损坏或不可读: {self.paths.index_path}。"
+                "全量自动重建已禁用，请先恢复索引备份，或离线执行受控重建。"
+            ) from exc
 
     def rebuild(self, force: bool = True) -> dict[str, Any]:
+        raise RuntimeError(
+            "全量重建文档索引已禁用。请使用 sync_document_index 做增量同步；"
+            "如确需全量重建，请使用离线脚本以临时库构建并原子替换主索引。"
+        )
+        # 保留旧实现供后续改造成离线原子重建；运行时入口禁止调用。
         self.paths.index_path.parent.mkdir(parents=True, exist_ok=True)
         if force and self.paths.index_path.exists():
             self.paths.index_path.unlink()
@@ -247,7 +273,10 @@ class DocumentIndex:
     def sync(self) -> dict[str, Any]:
         """Incrementally synchronize the SQLite index with the markdown corpus."""
         if not self.paths.index_path.exists():
-            return self.rebuild(force=True)
+            raise RuntimeError(
+                f"文档索引不存在: {self.paths.index_path}。"
+                "增量同步需要已有索引；请先恢复索引备份，或离线执行受控全量重建。"
+            )
 
         md_files = self._markdown_files()
         current_by_path = {
@@ -558,108 +587,83 @@ class DocumentIndex:
             }
         return result
 
-    def build_document_kb(self, *, force: bool = True,
-                          include_soft: bool = True) -> dict[str, Any]:
+    def build_document_kb(self, *, force: bool = False,
+                          include_soft: bool = False,
+                          limit: int = 0) -> dict[str, Any]:
         self.ensure()
         force = coerce_bool(force)
         include_soft = coerce_bool(include_soft)
-        relations: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        limit = max(0, int(limit or 0))
 
         with self._connect() as conn:
             self._init_schema(conn)
             docs = self._load_relation_documents(conn)
+            doc_terms = self._load_document_terms(conn)
+            title_keys = {
+                doc["document_id"]: normalize_series_title(doc.get("title", ""))
+                for doc in docs
+            }
+            signatures = {
+                doc["document_id"]: document_kb_signature(doc)
+                for doc in docs
+            }
+            changed_ids: set[str] | None = None
+            removed_state = 0
+
             if force:
                 conn.execute("delete from document_relations")
                 conn.execute("delete from document_metadata")
+                conn.execute("delete from document_kb_state")
+            else:
+                state = self._load_document_kb_state(conn)
+                doc_ids = set(signatures)
+                removed_ids = sorted(set(state) - doc_ids)
+                if removed_ids:
+                    self._delete_document_kb_for_ids(conn, removed_ids, delete_incoming=True)
+                    removed_state = len(removed_ids)
+                changed_ids = {
+                    document_id
+                    for document_id, signature in signatures.items()
+                    if (
+                        document_id not in state
+                        or state[document_id]["signature"] != signature
+                        or bool(state[document_id]["include_soft"]) != include_soft
+                    )
+                }
+                if not changed_ids and not removed_state:
+                    stats = self._document_relation_stats(conn)
+                    return {
+                        "status": "unchanged",
+                        "mode": "incremental",
+                        "documents": len(docs),
+                        "documents_changed": 0,
+                        "documents_pending": 0,
+                        "state_removed": 0,
+                        "relations": 0,
+                        "include_soft": include_soft,
+                        "stats": stats,
+                    }
+                total_changed = len(changed_ids)
+                if limit and len(changed_ids) > limit:
+                    changed_ids = set(sorted(changed_ids)[:limit])
+                self._delete_document_kb_for_ids(conn, sorted(changed_ids), delete_incoming=False)
+            if force:
+                total_changed = len(docs)
 
-            title_index = build_title_index(docs)
-            quote_to_docs: dict[str, list[dict[str, Any]]] = {}
-            series_to_docs: dict[str, list[dict[str, Any]]] = {}
-            doc_terms = self._load_document_terms(conn)
+            docs_to_refresh = docs if force else [
+                doc for doc in docs if doc["document_id"] in (changed_ids or set())
+            ]
+            self._upsert_document_metadata(conn, docs_to_refresh)
 
-            self._upsert_document_metadata(conn, docs)
-
-            for doc in docs:
-                for quote in doc["quoted_terms"]:
-                    quote_key = normalize_relation_text(quote)
-                    if len(quote_key) >= 6:
-                        quote_to_docs.setdefault(quote_key, []).append(doc)
-                series_key = normalize_series_title(doc["title"])
-                if len(series_key) >= 8:
-                    series_to_docs.setdefault(series_key, []).append(doc)
-
-            for doc in docs:
-                relation_role = classify_relation_role(doc["title"])
-                for quote in doc["quoted_terms"]:
-                    for target in match_title_targets(quote, title_index):
-                        if target["document_id"] == doc["document_id"]:
-                            continue
-                        target_role = classify_relation_role(target["title"])
-                        if relation_role and target_role == relation_role:
-                            continue
-                        relation_type = relation_type_for_role(relation_role)
-                        confidence = confidence_for_role(relation_role)
-                        add_relation(
-                            relations,
-                            doc,
-                            target,
-                            relation_type,
-                            confidence,
-                            f"标题或正文引用《{quote}》",
-                            source_chunk_id=doc.get("first_chunk_id", ""),
-                            method="rule",
-                        )
-
-                if relation_role in {"feedback", "request", "approval", "attachment"}:
-                    for target in match_profile_targets(doc, docs, doc_terms, limit=4):
-                        if target["document_id"] == doc["document_id"]:
-                            continue
-                        target_role = classify_relation_role(target["title"])
-                        if target_role == relation_role:
-                            continue
-                        add_relation(
-                            relations,
-                            doc,
-                            target,
-                            relation_type_for_role(relation_role),
-                            confidence_for_role(relation_role) - 0.08,
-                            f"文种/标题显示为{relation_role_label(relation_role)}，且核心词重合",
-                            source_chunk_id=doc.get("first_chunk_id", ""),
-                            method="lexical_profile",
-                        )
-
-            for quote_key, members in quote_to_docs.items():
-                if 2 <= len(members) <= 10:
-                    for source, target in directed_pairs(members):
-                        add_relation(
-                            relations,
-                            source,
-                            target,
-                            "shared_reference",
-                            min(0.84, 0.62 + len(quote_key) / 80),
-                            f"共同引用《{pick_original_quote(source, quote_key)}》",
-                            source_chunk_id=source.get("first_chunk_id", ""),
-                            method="rule",
-                        )
-
-            for _series_key, members in series_to_docs.items():
-                if 2 <= len(members) <= 8:
-                    for source, target in directed_pairs(members):
-                        relation_type = "same_matter" if exact_relation_title_key(source["title"]) == exact_relation_title_key(target["title"]) else "same_series"
-                        add_relation(
-                            relations,
-                            source,
-                            target,
-                            relation_type,
-                            0.78 if relation_type == "same_matter" else 0.68,
-                            "标题规范化后属于同一事项或同一系列",
-                            source_chunk_id=source.get("first_chunk_id", ""),
-                            method="rule",
-                        )
-
-            if include_soft:
-                self._add_soft_term_relations(relations, docs, doc_terms)
-                self._add_soft_embedding_relations(conn, relations, docs)
+            relations = self._build_document_relations(
+                conn,
+                docs,
+                doc_terms,
+                doc_term_index=self._build_doc_term_index(doc_terms),
+                title_keys=title_keys,
+                include_soft=include_soft,
+                focus_ids=None if force else changed_ids,
+            )
 
             inserted = 0
             for relation in relations.values():
@@ -685,21 +689,21 @@ class DocumentIndex:
                 )
                 inserted += 1
 
-            stats = [
-                dict(row) for row in conn.execute(
-                    """
-                    select relation_type, method, count(*) as count,
-                           round(avg(confidence), 3) as avg_confidence
-                    from document_relations
-                    group by relation_type, method
-                    order by relation_type, method
-                    """
-                )
-            ]
+            self._upsert_document_kb_state(
+                conn,
+                docs if force else docs_to_refresh,
+                signatures,
+                include_soft=include_soft,
+            )
+            stats = self._document_relation_stats(conn)
 
         return {
             "status": "rebuilt" if force else "updated",
+            "mode": "full" if force else "incremental",
             "documents": len(docs),
+            "documents_changed": len(docs) if force else len(changed_ids or set()),
+            "documents_pending": 0 if force else max(0, total_changed - len(changed_ids or set())),
+            "state_removed": removed_state,
             "relations": inserted,
             "include_soft": include_soft,
             "stats": stats,
@@ -1054,8 +1058,9 @@ class DocumentIndex:
             return [dict(row) for row in conn.execute(sql, [*params, limit, offset or 0])]
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.paths.index_path)
+        conn = sqlite3.connect(self.paths.index_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("pragma busy_timeout = 30000")
         return conn
 
     def _init_schema(self, conn: sqlite3.Connection) -> None:
@@ -1139,6 +1144,13 @@ class DocumentIndex:
                 primary key (document_id, key, value, method),
                 foreign key(document_id) references documents(document_id)
             );
+            create table if not exists document_kb_state (
+                document_id text primary key,
+                signature text not null,
+                include_soft integer not null,
+                refreshed_at real not null,
+                foreign key(document_id) references documents(document_id)
+            );
             create index if not exists idx_chunks_document on chunks(document_id, ordinal);
             create index if not exists idx_documents_category on documents(category);
             create index if not exists idx_document_terms_term on document_terms(term);
@@ -1147,6 +1159,7 @@ class DocumentIndex:
             create index if not exists idx_document_relations_target on document_relations(target_document_id);
             create index if not exists idx_document_relations_type on document_relations(relation_type);
             create index if not exists idx_document_metadata_key on document_metadata(key, value);
+            create index if not exists idx_document_kb_state_signature on document_kb_state(signature);
             """
         )
 
@@ -1177,6 +1190,7 @@ class DocumentIndex:
             """,
             (document_id, document_id),
         )
+        conn.execute("delete from document_kb_state where document_id = ?", (document_id,))
         conn.execute("delete from documents where document_id = ?", (document_id,))
 
     def _insert_parsed_document(self, conn: sqlite3.Connection,
@@ -1282,6 +1296,8 @@ class DocumentIndex:
             )
             doc["quoted_terms"] = extract_quoted_terms(title_relation_text)
             doc["relation_text"] = relation_text
+            doc["doc_numbers"] = extract_doc_numbers(title_relation_text)
+            doc["cited_doc_numbers"] = extract_doc_numbers(relation_text)
             docs.append(doc)
         return docs
 
@@ -1300,11 +1316,248 @@ class DocumentIndex:
                 terms[row["term"]] = float(row["score"])
         return by_doc
 
+    def _build_doc_term_index(self, doc_terms: dict[str, dict[str, float]]) -> dict[str, set[str]]:
+        index: dict[str, set[str]] = {}
+        for document_id, terms in doc_terms.items():
+            for term in terms:
+                if len(term) >= 3 and classify_term(term) not in {"form", "short"}:
+                    index.setdefault(term, set()).add(document_id)
+        return index
+
+    def _load_document_kb_state(self, conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+        rows = conn.execute(
+            """
+            select document_id, signature, include_soft, refreshed_at
+            from document_kb_state
+            """
+        ).fetchall()
+        return {
+            row["document_id"]: {
+                "signature": row["signature"],
+                "include_soft": bool(row["include_soft"]),
+                "refreshed_at": float(row["refreshed_at"] or 0.0),
+            }
+            for row in rows
+        }
+
+    def _delete_document_kb_for_ids(self, conn: sqlite3.Connection,
+                                    document_ids: list[str],
+                                    *,
+                                    delete_incoming: bool = False) -> None:
+        if not document_ids:
+            return
+        conn.executemany(
+            "delete from document_metadata where document_id = ?",
+            [(document_id,) for document_id in document_ids],
+        )
+        if delete_incoming:
+            conn.executemany(
+                """
+                delete from document_relations
+                where source_document_id = ? or target_document_id = ?
+                """,
+                [(document_id, document_id) for document_id in document_ids],
+            )
+        else:
+            conn.executemany(
+                "delete from document_relations where source_document_id = ?",
+                [(document_id,) for document_id in document_ids],
+            )
+        conn.executemany(
+            "delete from document_kb_state where document_id = ?",
+            [(document_id,) for document_id in document_ids],
+        )
+
+    def _upsert_document_kb_state(self, conn: sqlite3.Connection,
+                                  docs: list[dict[str, Any]],
+                                  signatures: dict[str, str],
+                                  *,
+                                  include_soft: bool) -> None:
+        refreshed_at = time.time()
+        conn.executemany(
+            """
+            insert or replace into document_kb_state
+            (document_id, signature, include_soft, refreshed_at)
+            values (?, ?, ?, ?)
+            """,
+            [
+                (
+                    doc["document_id"],
+                    signatures[doc["document_id"]],
+                    1 if include_soft else 0,
+                    refreshed_at,
+                )
+                for doc in docs
+                if doc["document_id"] in signatures
+            ],
+        )
+
+    def _document_relation_stats(self, conn: sqlite3.Connection) -> list[dict[str, Any]]:
+        return [
+            dict(row) for row in conn.execute(
+                """
+                select relation_type, method, count(*) as count,
+                       round(avg(confidence), 3) as avg_confidence
+                from document_relations
+                group by relation_type, method
+                order by relation_type, method
+                """
+            )
+        ]
+
+    def _build_document_relations(self, conn: sqlite3.Connection,
+                                  docs: list[dict[str, Any]],
+                                  doc_terms: dict[str, dict[str, float]],
+                                  doc_term_index: dict[str, set[str]],
+                                  title_keys: dict[str, str],
+                                  *,
+                                  include_soft: bool,
+                                  focus_ids: set[str] | None = None,
+                                  ) -> dict[tuple[str, str, str, str], dict[str, Any]]:
+        relations: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        title_index = build_title_index(docs)
+        doc_number_index = build_doc_number_index(docs)
+        quote_to_docs: dict[str, list[dict[str, Any]]] = {}
+        series_to_docs: dict[str, list[dict[str, Any]]] = {}
+        focus_ids = set(focus_ids or [])
+
+        for doc in docs:
+            for quote in doc["quoted_terms"]:
+                quote_key = normalize_relation_text(quote)
+                if len(quote_key) >= 6:
+                    quote_to_docs.setdefault(quote_key, []).append(doc)
+            series_key = normalize_series_title(doc["title"])
+            if len(series_key) >= 8:
+                series_to_docs.setdefault(series_key, []).append(doc)
+
+        docs_to_scan = docs if not focus_ids else [
+            doc for doc in docs if doc["document_id"] in focus_ids
+        ]
+
+        for doc in docs_to_scan:
+            relation_role = classify_relation_role(doc["title"])
+            for quote in doc["quoted_terms"]:
+                for target in match_title_targets(quote, title_index):
+                    if target["document_id"] == doc["document_id"]:
+                        continue
+                    target_role = classify_relation_role(target["title"])
+                    if relation_role and target_role == relation_role:
+                        continue
+                    relation_type = relation_type_for_role(relation_role)
+                    if not relation_role:
+                        relation_type = classify_enhanced_relation_type(
+                            doc,
+                            quote,
+                            default=relation_type,
+                        )
+                    add_relation(
+                        relations,
+                        doc,
+                        target,
+                        relation_type,
+                        confidence_for_enhanced_relation(relation_type, relation_role),
+                        f"标题或正文引用《{quote}》",
+                        source_chunk_id=doc.get("first_chunk_id", ""),
+                        method="rule",
+                    )
+
+            for doc_number in doc.get("cited_doc_numbers", []):
+                for target in doc_number_index.get(doc_number, []):
+                    if target["document_id"] == doc["document_id"]:
+                        continue
+                    relation_type = classify_enhanced_relation_type(
+                        doc,
+                        doc_number,
+                        default="cites_by_doc_no",
+                    )
+                    add_relation(
+                        relations,
+                        doc,
+                        target,
+                        relation_type,
+                        confidence_for_enhanced_relation(relation_type, ""),
+                        f"标题或正文引用文号 {doc_number}",
+                        source_chunk_id=doc.get("first_chunk_id", ""),
+                        target_chunk_id=target.get("first_chunk_id", ""),
+                        method="doc_number",
+                        metadata={"doc_number": doc_number},
+                    )
+
+            if relation_role in {"feedback", "request", "approval", "attachment"}:
+                for target in match_profile_targets(
+                    doc,
+                    docs,
+                    doc_terms,
+                    doc_term_index=doc_term_index,
+                    title_keys=title_keys,
+                    limit=4,
+                ):
+                    if target["document_id"] == doc["document_id"]:
+                        continue
+                    target_role = classify_relation_role(target["title"])
+                    if target_role == relation_role:
+                        continue
+                    add_relation(
+                        relations,
+                        doc,
+                        target,
+                        relation_type_for_role(relation_role),
+                        confidence_for_role(relation_role) - 0.08,
+                        f"文种/标题显示为{relation_role_label(relation_role)}，且核心词重合",
+                        source_chunk_id=doc.get("first_chunk_id", ""),
+                        method="lexical_profile",
+                    )
+
+        for quote_key, members in quote_to_docs.items():
+            if 2 <= len(members) <= 10 and self._relation_group_touches_focus(members, focus_ids):
+                for source, target in directed_pairs(members):
+                    add_relation(
+                        relations,
+                        source,
+                        target,
+                        "shared_reference",
+                        min(0.84, 0.62 + len(quote_key) / 80),
+                        f"共同引用《{pick_original_quote(source, quote_key)}》",
+                        source_chunk_id=source.get("first_chunk_id", ""),
+                        method="rule",
+                    )
+
+        for _series_key, members in series_to_docs.items():
+            if 2 <= len(members) <= 8 and self._relation_group_touches_focus(members, focus_ids):
+                for source, target in directed_pairs(members):
+                    relation_type = "same_matter" if exact_relation_title_key(source["title"]) == exact_relation_title_key(target["title"]) else "same_series"
+                    add_relation(
+                        relations,
+                        source,
+                        target,
+                        relation_type,
+                        0.78 if relation_type == "same_matter" else 0.68,
+                        "标题规范化后属于同一事项或同一系列",
+                        source_chunk_id=source.get("first_chunk_id", ""),
+                        method="rule",
+                    )
+
+        if include_soft:
+            self._add_soft_term_relations(relations, docs, doc_terms, focus_ids=focus_ids or None)
+            self._add_soft_embedding_relations(conn, relations, docs, focus_ids=focus_ids or None)
+
+        return relations
+
+    def _relation_group_touches_focus(self, docs: list[dict[str, Any]],
+                                      focus_ids: set[str]) -> bool:
+        if not focus_ids:
+            return True
+        return any(doc["document_id"] in focus_ids for doc in docs)
+
     def _add_soft_term_relations(self, relations: dict[tuple[str, str, str, str], dict[str, Any]],
                                  docs: list[dict[str, Any]],
-                                 doc_terms: dict[str, dict[str, float]]) -> None:
+                                 doc_terms: dict[str, dict[str, float]],
+                                 focus_ids: set[str] | None = None) -> None:
         by_id = {doc["document_id"]: doc for doc in docs}
-        for source in docs:
+        sources = docs if not focus_ids else [
+            doc for doc in docs if doc["document_id"] in focus_ids
+        ]
+        for source in sources:
             scored = []
             source_terms = doc_terms.get(source["document_id"], {})
             if not source_terms:
@@ -1332,7 +1585,8 @@ class DocumentIndex:
 
     def _add_soft_embedding_relations(self, conn: sqlite3.Connection,
                                       relations: dict[tuple[str, str, str, str], dict[str, Any]],
-                                      docs: list[dict[str, Any]]) -> None:
+                                      docs: list[dict[str, Any]],
+                                      focus_ids: set[str] | None = None) -> None:
         if not self.embedding_config.enabled:
             return
         rows = conn.execute(
@@ -1361,7 +1615,9 @@ class DocumentIndex:
         }
         by_id = {doc["document_id"]: doc for doc in docs}
         threshold = max(0.64, self.embedding_config.min_similarity + 0.04)
-        for source_id, source_vector in averaged.items():
+        source_ids = set(averaged) if not focus_ids else set(focus_ids) & set(averaged)
+        for source_id in source_ids:
+            source_vector = averaged[source_id]
             source = by_id.get(source_id)
             if not source:
                 continue
@@ -2325,6 +2581,15 @@ def infer_document_metadata(doc: dict[str, Any]) -> list[dict[str, Any]]:
                     "method": method,
                 })
 
+    for doc_number in extract_doc_numbers(structural_text):
+        items.append({
+            "key": "doc_number",
+            "value": doc_number,
+            "confidence": 0.88,
+            "evidence": doc_number,
+            "method": "structural_doc_number",
+        })
+
     char_count = int(doc.get("char_count", 0) or 0)
     if char_count < 80:
         quality, confidence = "empty", 0.95
@@ -2756,6 +3021,25 @@ def stable_id(value: str) -> str:
     return hashlib.sha1(value.encode("utf-8")).hexdigest()[:16]
 
 
+def document_kb_signature(doc: dict[str, Any]) -> str:
+    payload = {
+        "kb_extractor_version": DOCUMENT_KB_EXTRACTOR_VERSION,
+        "title": doc.get("title", ""),
+        "category": doc.get("category", ""),
+        "agency": doc.get("agency", ""),
+        "doc_type": doc.get("doc_type", ""),
+        "date_text": doc.get("date_text", ""),
+        "char_count": doc.get("char_count", 0),
+        "headings": doc.get("headings", ""),
+        "content_sample": doc.get("content_sample", ""),
+        "quoted_terms": doc.get("quoted_terms", []),
+        "doc_numbers": doc.get("doc_numbers", []),
+        "cited_doc_numbers": doc.get("cited_doc_numbers", []),
+        "relation_text": doc.get("relation_text", ""),
+    }
+    return stable_id(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
 def embedding_text(row: dict[str, Any], max_chars: int) -> str:
     header = "\n".join(
         part for part in [
@@ -3068,6 +3352,44 @@ def extract_quoted_terms(text: str) -> list[str]:
     return terms[:30]
 
 
+def extract_doc_numbers(text: str) -> list[str]:
+    numbers = []
+    seen = set()
+    patterns = [
+        r"[\u4e00-\u9fffA-Za-z]{1,12}[〔\[]20\d{2}[〕\]][\u4e00-\u9fffA-Za-z]{0,8}\d{1,5}号?",
+        r"[\u4e00-\u9fffA-Za-z]{1,12}\(20\d{2}\)[\u4e00-\u9fffA-Za-z]{0,8}\d{1,5}号?",
+        r"[\u4e00-\u9fffA-Za-z]{1,12}发〔20\d{2}〕\d{1,5}号?",
+        r"[\u4e00-\u9fffA-Za-z]{1,12}函〔20\d{2}〕\d{1,5}号?",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, text or ""):
+            normalized = normalize_doc_number(match.group(0))
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            numbers.append(normalized)
+            if len(numbers) >= 20:
+                return numbers
+    return numbers
+
+
+def normalize_doc_number(text: str) -> str:
+    clean = re.sub(r"\s+", "", text or "")
+    clean = clean.replace("［", "[").replace("］", "]")
+    clean = clean.replace("[", "〔").replace("]", "〕")
+    clean = clean.replace("（", "(").replace("）", ")")
+    clean = re.sub(r"\((20\d{2})\)", r"〔\1〕", clean)
+    clean = re.sub(r"号$", "", clean)
+    clean = re.sub(r"^[和及与、，,；;：:。关于依据根据按照遵照落实执行修订废止替代取代转发印发]+", "", clean)
+    if not re.search(r"〔20\d{2}〕", clean):
+        return ""
+    if not re.search(r"\d+$", clean):
+        return ""
+    if len(clean) < 7 or len(clean) > 40:
+        return ""
+    return clean
+
+
 def normalize_relation_text(text: str) -> str:
     clean = re.sub(r"\s+", "", text or "")
     clean = re.sub(r"[\(\)（）\[\]【】〔〕“”\"'、，。；;:：!！?？]", "", clean)
@@ -3104,6 +3426,19 @@ def build_title_index(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         }
         index.append({**doc, "_title_keys": {key for key in keys if len(key) >= 4}})
     return index
+
+
+def build_doc_number_index(docs: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    index: dict[str, list[dict[str, Any]]] = {}
+    for doc in docs:
+        numbers = list(dict.fromkeys(doc.get("doc_numbers", [])))
+        for number in numbers[:6]:
+            index.setdefault(number, []).append(doc)
+    return {
+        number: members
+        for number, members in index.items()
+        if 1 <= len(members) <= 5
+    }
 
 
 def match_title_targets(quote: str, title_index: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3161,18 +3496,109 @@ def relation_role_label(role: str) -> str:
     }.get(role, "引用")
 
 
+def classify_enhanced_relation_type(source: dict[str, Any],
+                                    evidence_text: str = "",
+                                    *,
+                                    default: str = "cites") -> str:
+    text = "\n".join([
+        str(source.get("title", "") or ""),
+        relation_evidence_context(str(source.get("relation_text", "") or ""), evidence_text),
+    ])
+    if re.search(r"废止|停止执行|宣布失效|予以废止|不再执行", text):
+        return "abolishes"
+    if re.search(r"修订|修改|修正|调整|补充|更新", text):
+        return "revises"
+    if re.search(r"替代|取代|代替|替换|原.*同时废止", text):
+        return "replaces"
+    if re.search(r"征求意见|征询意见|征求.*建议|公开征求", text):
+        return "solicits_opinion_on"
+    if re.search(r"依据|根据|按照|遵照|依照", text):
+        return "based_on"
+    if re.search(r"贯彻|落实|实施|执行", text):
+        return "implements"
+    return default
+
+
+def relation_evidence_context(text: str, needle: str, window: int = 180) -> str:
+    if not needle:
+        return text[:window]
+    normalized_needle = normalize_doc_number(needle) or needle
+    candidates = [needle, normalized_needle]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        pos = text.find(candidate)
+        if pos >= 0:
+            start = max(0, pos - window)
+            end = min(len(text), pos + len(candidate) + window)
+            return text[start:end]
+    compact_text = re.sub(r"\s+", "", text)
+    compact_needle = re.sub(r"\s+", "", normalized_needle)
+    pos = compact_text.find(compact_needle)
+    if pos >= 0:
+        start = max(0, pos - window)
+        end = min(len(compact_text), pos + len(compact_needle) + window)
+        return compact_text[start:end]
+    return text[:window]
+
+
+def confidence_for_enhanced_relation(relation_type: str, role: str) -> float:
+    if role:
+        return confidence_for_role(role)
+    return {
+        "based_on": 0.86,
+        "abolishes": 0.88,
+        "revises": 0.84,
+        "replaces": 0.86,
+        "solicits_opinion_on": 0.82,
+        "cites_by_doc_no": 0.82,
+        "implements": 0.84,
+    }.get(relation_type, 0.74)
+
+
 def match_profile_targets(source: dict[str, Any], docs: list[dict[str, Any]],
                           doc_terms: dict[str, dict[str, float]],
+                          *,
+                          doc_term_index: dict[str, set[str]] | None = None,
+                          title_keys: dict[str, str] | None = None,
                           limit: int = 4) -> list[dict[str, Any]]:
     source_id = source["document_id"]
     source_terms = doc_terms.get(source_id, {})
+    if not source_terms:
+        return []
+    by_id = {doc["document_id"]: doc for doc in docs}
+    title_keys = title_keys or {}
+    source_title_key = title_keys.get(source_id) or normalize_series_title(source.get("title", ""))
+    candidate_ids: set[str] = set()
+    if doc_term_index:
+        useful_terms = [
+            term for term in sorted(
+                source_terms,
+                key=lambda term: (-source_terms[term], -len(term), term),
+            )
+            if len(term) >= 3 and classify_term(term) not in {"form", "short"}
+        ][:12]
+        for term in useful_terms:
+            candidate_ids.update(doc_term_index.get(term, set()))
+    if source_title_key:
+        for doc in docs:
+            target_title_key = title_keys.get(doc["document_id"], "")
+            if target_title_key and (
+                source_title_key in target_title_key or target_title_key in source_title_key
+            ):
+                candidate_ids.add(doc["document_id"])
+    if not candidate_ids:
+        return []
+
     scored = []
-    for target in docs:
-        if target["document_id"] == source_id:
+    for target_id in candidate_ids:
+        if target_id == source_id:
+            continue
+        target = by_id.get(target_id)
+        if not target:
             continue
         score, overlap = weighted_term_overlap(source_terms, doc_terms.get(target["document_id"], {}))
-        source_title_key = normalize_series_title(source.get("title", ""))
-        target_title_key = normalize_series_title(target.get("title", ""))
+        target_title_key = title_keys.get(target["document_id"], "")
         if source_title_key and target_title_key and (
             source_title_key in target_title_key or target_title_key in source_title_key
         ):

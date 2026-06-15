@@ -53,8 +53,9 @@ def register(registry: FunctionRegistry, store: ObjectRepository, ontology: Onto
             debug=kw.get("debug", False),
         ),
         "build_document_kb": lambda **kw: index.build_document_kb(
-            force=kw.get("force", True),
-            include_soft=kw.get("include_soft", True),
+            force=kw.get("force", False),
+            include_soft=kw.get("include_soft", False),
+            limit=kw.get("limit", 0) or 0,
         ),
         "find_document_relations": lambda **kw: index.find_document_relations(
             path=kw.get("path", "") or "",

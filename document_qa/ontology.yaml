@@ -2,6 +2,21 @@ name: document_qa
 description: "本地 MinerU Markdown 文档库问答。回答文档内容、某人/机构/关键词相关内容、出现位置、涉及事项时，应优先使用本领域 search_documents/read_document/prepare_answer_context，而不是通用 search 直接作答；通过按需检索和按需读取，为回答提供可追溯出处。"
 tool_preferences:
   generic_search: fallback_only
+excluded_tools:
+  - inspect
+  - describe
+  - pivot
+  - distribution
+  - count
+  - query
+  - query_links
+  - mutate
+  - search
+  - start_workflow
+  - check_sla
+  - apply_rule
+  - apply_rule_batch
+  - dispatch_workers
 
 objects:
   Document:
@@ -62,7 +77,7 @@ objects:
       target_document_id: {type: str, description: "目标文档ID"}
       target_title: {type: str, description: "目标文档标题"}
       target_path: {type: str, description: "目标文档路径"}
-      relation_type: {type: str, description: "关系类型，如 cites、feedback_to、request_for、same_series、topically_related、semantically_related"}
+      relation_type: {type: str, description: "关系类型，如 cites、cites_by_doc_no、based_on、implements、revises、replaces、abolishes、solicits_opinion_on、feedback_to、request_for、same_series、topically_related、semantically_related"}
       confidence: {type: float, description: "关系置信度，0到1"}
       evidence: {type: str, description: "关系证据说明"}
       method: {type: str, description: "构建方法，如 rule、lexical_profile、embedding"}
@@ -150,14 +165,15 @@ functions:
 
   build_document_kb:
     summary: "构建文档关系知识库"
-    description: "基于正式文档库构建 document_relations：优先抽取引用、反馈、请示/批复、附件、同系列等可解释硬关系，并可补充核心短语/embedding 的软主题关系。"
-    usage_prompt: "只有当用户明确要求构建/刷新文档关系 KB，或文档索引更新后需要刷新关系时才调用。普通问答不要频繁重建。"
+    description: "基于正式文档库增量构建 document_relations：优先抽取标题引用、文号引用、依据/落实、修订/替代/废止、征求意见、反馈、请示/批复、附件、同系列等可解释硬关系，并可按需补充核心短语/embedding 的软主题关系。force=false 时只刷新新增、内容变化或抽取器版本变化的文档关系；force=true 才清空并全量重建；limit 可限制单次刷新文档数用于分批初始化。"
+    usage_prompt: "只有当用户明确要求构建/刷新文档关系 KB，或文档索引更新后需要刷新关系时才调用。默认使用 force=false、include_soft=false 增量刷新硬关系；大型库首次初始化可设置 limit 分批调用直到 documents_pending=0；只有用户明确要求全量重建或关系状态损坏时才使用 force=true；只有明确需要软主题关系时才设置 include_soft=true。普通问答不要频繁重建。"
     user_visible: false
     function_type: lookup
     involves_objects: [Document, DocumentRelation]
     params:
-      force: {type: bool, description: "是否清空并重建关系表，默认 true", default: true}
-      include_soft: {type: bool, description: "是否包含核心短语和 embedding 软关系，默认 true", default: true}
+      force: {type: bool, description: "是否清空并全量重建关系表，默认 false；false 会基于 document_kb_state 只刷新新增或变化文档", default: false}
+      include_soft: {type: bool, description: "是否包含核心短语和 embedding 软关系，默认 false；大型库建议先只增量刷新硬关系", default: false}
+      limit: {type: int, description: "force=false 时单次最多刷新多少篇变化文档；0 表示不限制。大型库首次初始化建议分批设置", default: 0}
 
   find_document_relations:
     summary: "查询某份正式文档的文档关系"
@@ -169,7 +185,7 @@ functions:
       path: {type: str, description: "正式文档路径，可选", default: ""}
       document_id: {type: str, description: "正式文档ID，可选", default: ""}
       title_like: {type: str, description: "正式文档标题关键词，可选", default: ""}
-      relation_type: {type: str, description: "可选，关系类型过滤，如 feedback_to、request_for、shared_reference、topically_related", default: ""}
+      relation_type: {type: str, description: "可选，关系类型过滤，如 based_on、implements、revises、abolishes、feedback_to、request_for、shared_reference、topically_related", default: ""}
       direction: {type: str, description: "source、target 或 both，默认 both", default: "both"}
       limit: {type: int, description: "返回关系数量，默认20", default: 20}
 
