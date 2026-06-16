@@ -65,6 +65,33 @@ def register(registry: FunctionRegistry, store: ObjectRepository, ontology: Onto
             direction=kw.get("direction", "both") or "both",
             limit=kw.get("limit", 20) or 20,
         ),
+        "find_document_relation_groups": lambda **kw: index.find_document_relation_groups(
+            query=kw.get("query", "") or "",
+            relation_types=kw.get("relation_types", "") or "",
+            title_like=kw.get("title_like", "") or "",
+            limit=kw.get("limit", 5) or 5,
+            min_relations=kw.get("min_relations", 2) or 2,
+            max_documents_per_group=kw.get("max_documents_per_group", 8) or 8,
+        ),
+        "find_document_relation_paths": lambda **kw: index.find_document_relation_paths(
+            start_document_id=kw.get("start_document_id", "") or "",
+            start_path=kw.get("start_path", "") or "",
+            start_title_like=kw.get("start_title_like", "") or "",
+            end_document_id=kw.get("end_document_id", "") or "",
+            end_path=kw.get("end_path", "") or "",
+            end_title_like=kw.get("end_title_like", "") or "",
+            relation_types=kw.get("relation_types", "") or "",
+            direction=kw.get("direction", "both") or "both",
+            max_depth=kw.get("max_depth", 3) or 3,
+            limit=kw.get("limit", 10) or 10,
+        ),
+        "analyze_document_graph": lambda **kw: index.analyze_document_graph(
+            query=kw.get("query", "") or "",
+            relation_types=kw.get("relation_types", "") or "",
+            top_n=kw.get("top_n", 10) or 10,
+            min_confidence=kw.get("min_confidence", 0.0) or 0.0,
+            max_edges=kw.get("max_edges", 20000) or 20000,
+        ),
         "expand_document_context": lambda **kw: index.expand_document_context(
             path=kw.get("path", "") or "",
             document_id=kw.get("document_id", "") or "",
@@ -86,6 +113,7 @@ def register(registry: FunctionRegistry, store: ObjectRepository, ontology: Onto
         "rebuild_document_embeddings": lambda **kw: index.rebuild_embeddings(
             force=kw.get("force", False),
         ),
+        "rebuild_document_vector_index": lambda **kw: index.rebuild_vector_index(),
     }
 
     for name, fn in fn_map.items():

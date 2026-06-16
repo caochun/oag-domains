@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -26,6 +27,18 @@ try:
     from sentence_transformers import SentenceTransformer
 except Exception:  # pragma: no cover - optional dependency fallback
     SentenceTransformer = None
+
+try:
+    import numpy as np
+except Exception:  # pragma: no cover - optional dependency fallback
+    np = None
+
+from .graph_analysis import (
+    DEFAULT_RELATION_GROUP_TYPES,
+    analyze_relation_graph,
+    build_relation_groups,
+    find_relation_paths,
+)
 
 
 IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
@@ -77,6 +90,18 @@ class DocumentPaths:
     repo_root: Path
     corpus_root: Path
     index_path: Path
+
+    @property
+    def derived_dir(self) -> Path:
+        return self.index_path.parent
+
+    @property
+    def faiss_index_path(self) -> Path:
+        return self.derived_dir / "chunk_embeddings.faiss"
+
+    @property
+    def faiss_meta_path(self) -> Path:
+        return self.derived_dir / "chunk_embeddings.faiss.json"
 
 
 @dataclass
@@ -134,6 +159,14 @@ def cached_hf_snapshot(model_id: str) -> Path | None:
     return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
+def load_faiss():
+    if importlib.util.find_spec("faiss") is None:
+        return None
+    import faiss  # type: ignore
+
+    return faiss
+
+
 class DocumentIndex:
     def __init__(self, paths: DocumentPaths):
         self.paths = paths
@@ -148,8 +181,7 @@ class DocumentIndex:
         try:
             with self._connect() as conn:
                 indexed = conn.execute("select count(*) from documents").fetchone()[0]
-            files = len(self._markdown_files())
-            if indexed == 0 and files:
+            if indexed == 0:
                 raise RuntimeError(
                     f"文档索引为空: {self.paths.index_path}。"
                     "全量自动重建已禁用，请先恢复索引备份，或离线执行受控重建。"
@@ -421,6 +453,71 @@ class DocumentIndex:
             "chunks_considered": len(rows),
             "chunks_embedded": embedded,
             "dimensions": dimensions,
+            "faiss": self.rebuild_vector_index(ensure_index=False),
+        }
+
+    def rebuild_vector_index(self, ensure_index: bool = True) -> dict[str, Any]:
+        if ensure_index:
+            self.ensure()
+        if np is None:
+            return {"status": "unavailable", "message": "numpy package is not available"}
+        faiss = load_faiss()
+        if faiss is None:
+            return {"status": "unavailable", "message": "faiss-cpu package is not available"}
+
+        config = self.embedding_config
+        with self._connect() as conn:
+            self._init_schema(conn)
+            rows = conn.execute(
+                """
+                select e.chunk_id, e.dim, e.embedding
+                from chunk_embeddings e
+                join chunks c on c.chunk_id = e.chunk_id
+                where e.model = ?
+                order by c.document_id, c.ordinal
+                """,
+                (config.model,),
+            ).fetchall()
+        if not rows:
+            return {"status": "empty", "model": config.model, "vectors": 0}
+
+        dim = int(rows[0]["dim"])
+        vectors = np.empty((len(rows), dim), dtype="float32")
+        chunk_ids = []
+        for idx, row in enumerate(rows):
+            if int(row["dim"]) != dim:
+                continue
+            vectors[idx] = np.frombuffer(row["embedding"], dtype="<f4", count=dim)
+            chunk_ids.append(row["chunk_id"])
+        if len(chunk_ids) != len(rows):
+            vectors = vectors[:len(chunk_ids)]
+
+        index = faiss.IndexFlatIP(dim)
+        index.add(vectors)
+        self.paths.derived_dir.mkdir(parents=True, exist_ok=True)
+        faiss.write_index(index, str(self.paths.faiss_index_path))
+        self.paths.faiss_meta_path.write_text(
+            json.dumps(
+                {
+                    "model": config.model,
+                    "dim": dim,
+                    "metric": "inner_product",
+                    "normalized": True,
+                    "count": len(chunk_ids),
+                    "chunk_ids": chunk_ids,
+                    "built_at": time.time(),
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        return {
+            "status": "rebuilt",
+            "model": config.model,
+            "vectors": len(chunk_ids),
+            "dimensions": dim,
+            "index_path": str(self.paths.faiss_index_path),
+            "metadata_path": str(self.paths.faiss_meta_path),
         }
 
     def search(self, query: str, *, category: str = "", agency: str = "",
@@ -460,16 +557,20 @@ class DocumentIndex:
                 result["debug"] = {
                     "recall_count": len(recall_hits),
                     "rerank": "document_level_query_profile",
+                    "recall_sources": summarize_recall_sources(recall_hits),
                 }
             return result
         hits = self._strip_internal_fields(ranked_candidates[:limit])
-        return {
+        result = {
             "query": clean_query,
             "filters": compact_dict({"category": category, "agency": agency, "doc_type": doc_type}),
             "semantic": semantic,
             "count": len(hits),
             "hits": hits,
         }
+        if debug:
+            result["debug"] = {"recall_sources": summarize_recall_sources(hits)}
+        return result
 
     def list_documents(self, *, category: str = "", agency: str = "",
                        doc_type: str = "", title_like: str = "",
@@ -525,8 +626,14 @@ class DocumentIndex:
                 doc = self._get_doc(conn, document_id)
             elif path:
                 doc = conn.execute(
-                    "select * from documents where path = ? or path like ? limit 1",
-                    (path, f"%{path}%"),
+                    """
+                    select *
+                    from documents
+                    where path = ? or path like ?
+                    order by case when path = ? then 0 else 1 end, length(path), path
+                    limit 1
+                    """,
+                    (path, f"%{path}%", path),
                 ).fetchone()
             if not doc:
                 return {"error": "请提供有效的 path、document_id 或 chunk_id"}
@@ -763,6 +870,125 @@ class DocumentIndex:
             "relations": [format_relation_row(row, focus["document_id"]) for row in rows],
         }
 
+    def find_document_relation_groups(self, *, query: str = "",
+                                      relation_types: str = "",
+                                      title_like: str = "",
+                                      limit: int = 5,
+                                      min_relations: int = 2,
+                                      max_documents_per_group: int = 8) -> dict[str, Any]:
+        self.ensure()
+        limit = max(1, min(int(limit or 5), 20))
+        min_relations = max(1, min(int(min_relations or 2), 20))
+        max_documents_per_group = max(2, min(int(max_documents_per_group or 8), 20))
+        wanted_types = parse_relation_types(relation_types)
+        query_terms = tokenize_terms(query, 12)
+        title_filter = (title_like or "").strip()
+
+        with self._connect() as conn:
+            self._init_schema(conn)
+            rows = self._load_relation_group_rows(
+                conn,
+                wanted_types=wanted_types,
+                query_terms=query_terms,
+                title_like=title_filter,
+            )
+
+        components = build_relation_groups(
+            rows,
+            min_relations=min_relations,
+            max_documents_per_group=max_documents_per_group,
+        )
+        return {
+            "query": query,
+            "title_like": title_filter,
+            "relation_types": wanted_types,
+            "min_relations": min_relations,
+            "count": len(components[:limit]),
+            "groups": components[:limit],
+            "usage_note": "关系组用于发现候选关联公文；关键事实、正文细节和最终结论仍需 read_document 核对原文。",
+        }
+
+    def find_document_relation_paths(self, *, start_document_id: str = "",
+                                     start_path: str = "",
+                                     start_title_like: str = "",
+                                     end_document_id: str = "",
+                                     end_path: str = "",
+                                     end_title_like: str = "",
+                                     relation_types: str = "",
+                                     direction: str = "both",
+                                     max_depth: int = 3,
+                                     limit: int = 10) -> dict[str, Any]:
+        self.ensure()
+        max_depth = max(1, min(int(max_depth or 3), 5))
+        limit = max(1, min(int(limit or 10), 50))
+        direction = (direction or "both").strip().lower()
+        if direction not in {"outgoing", "incoming", "both"}:
+            direction = "both"
+        wanted_types = parse_relation_types(relation_types)
+
+        with self._connect() as conn:
+            self._init_schema(conn)
+            start = self._resolve_relation_document(
+                conn,
+                path=start_path,
+                document_id=start_document_id,
+                title_like=start_title_like,
+            )
+            if not start:
+                return {"error": "请提供有效的 start_document_id、start_path 或 start_title_like 来定位起点文档"}
+            end = None
+            if end_document_id or end_path or end_title_like:
+                end = self._resolve_relation_document(
+                    conn,
+                    path=end_path,
+                    document_id=end_document_id,
+                    title_like=end_title_like,
+                )
+                if not end:
+                    return {"error": "未找到终点文档，请检查 end_document_id、end_path 或 end_title_like"}
+            rows = self._load_path_relation_rows(conn, wanted_types=wanted_types)
+
+        paths = find_relation_paths(
+            [dict(row) for row in rows],
+            start_id=start["document_id"],
+            end_id=end["document_id"] if end else "",
+            direction=direction,
+            max_depth=max_depth,
+            limit=limit,
+        )
+        return {
+            "start_document": dict(start),
+            "end_document": dict(end) if end else None,
+            "direction": direction,
+            "relation_types": wanted_types,
+            "max_depth": max_depth,
+            "count": len(paths),
+            "paths": paths,
+            "usage_note": "多跳路径是关系线索，不等于事实结论；回答具体事实前应读取路径上的关键文档原文。",
+        }
+
+    def analyze_document_graph(self, *, query: str = "",
+                               relation_types: str = "",
+                               top_n: int = 10,
+                               min_confidence: float = 0.0,
+                               max_edges: int = 20000) -> dict[str, Any]:
+        self.ensure()
+        wanted_types = parse_relation_types(relation_types)
+        query_terms = tokenize_terms(query, 12)
+        top_n = max(1, min(int(top_n or 10), 50))
+        min_confidence = max(0.0, min(float(min_confidence or 0.0), 1.0))
+        max_edges = max(100, min(int(max_edges or 20000), 100000))
+
+        with self._connect() as conn:
+            rows = self._load_graph_relation_rows(
+                conn,
+                wanted_types=wanted_types,
+                query_terms=query_terms,
+                min_confidence=min_confidence,
+                max_edges=max_edges,
+            )
+        return analyze_relation_graph(rows, top_n=top_n)
+
     def expand_document_context(self, *, path: str = "", document_id: str = "",
                                 title_like: str = "", relation_types: str = "",
                                 limit: int = 20) -> dict[str, Any]:
@@ -845,7 +1071,7 @@ class DocumentIndex:
                     if doc_id not in known:
                         doc_scores.append({
                             **suggestion["document"],
-                            "context_score": max(0.0, float(suggestion["confidence"]) * 10.0),
+                            "context_score": max(0.0, float(suggestion["confidence"]) * 4.0),
                             "selection_reason": f"KB关系扩展：{suggestion['relation_type']} - {suggestion['evidence']}",
                             "search_hit_count": 0,
                             "best_hit": {},
@@ -859,19 +1085,30 @@ class DocumentIndex:
                     "metadata": all_metadata.get(item["document_id"], {}),
                 })
                 item["_temporal"] = temporal
+                best_year = temporal.get("best_year")
+                item["_matches_expected_year"] = (
+                    bool(expected_years)
+                    and bool(best_year)
+                    and best_year in expected_years
+                )
                 item["_out_of_time_range"] = (
                     bool(expected_years)
-                    and bool(temporal.get("best_year"))
-                    and temporal["best_year"] not in expected_years
+                    and bool(best_year)
+                    and best_year not in expected_years
                 )
 
-            eligible_doc_scores = [item for item in doc_scores if not item.get("_out_of_time_range")]
+            if expected_years:
+                eligible_doc_scores = [item for item in doc_scores if item.get("_matches_expected_year")]
+            else:
+                eligible_doc_scores = [item for item in doc_scores if not item.get("_out_of_time_range")]
             if len(eligible_doc_scores) < min(limit_docs, 2):
                 eligible_doc_scores = doc_scores
 
             selected = sorted(
                 eligible_doc_scores,
                 key=lambda item: (
+                    expected_years and not bool(item.get("_matches_expected_year")),
+                    not bool(item.get("search_hit_count", 0)),
                     bool(item.get("_out_of_time_range")),
                     -float(item.get("context_score", 0.0)),
                     int(item.get("char_count", 0)) < 200,
@@ -1656,9 +1893,12 @@ class DocumentIndex:
             return conn.execute(
                 """
                 select document_id, title, path, category, agency, doc_type, date_text, char_count
-                from documents where path = ? or path like ? order by length(path) limit 1
+                from documents
+                where path = ? or path like ?
+                order by case when path = ? then 0 else 1 end, length(path), path
+                limit 1
                 """,
-                (path, f"%{path}%"),
+                (path, f"%{path}%", path),
             ).fetchone()
         if title_like:
             return conn.execute(
@@ -1832,6 +2072,122 @@ class DocumentIndex:
                 break
         return suggestions
 
+    def _load_relation_group_rows(self, conn: sqlite3.Connection,
+                                  *,
+                                  wanted_types: list[str],
+                                  query_terms: list[str],
+                                  title_like: str) -> list[dict[str, Any]]:
+        where = []
+        params: list[Any] = []
+        if wanted_types:
+            placeholders = ",".join("?" for _ in wanted_types)
+            where.append(f"r.relation_type in ({placeholders})")
+            params.extend(wanted_types)
+        else:
+            placeholders = ",".join("?" for _ in DEFAULT_RELATION_GROUP_TYPES)
+            where.append(f"r.relation_type in ({placeholders})")
+            params.extend(DEFAULT_RELATION_GROUP_TYPES)
+        if title_like:
+            like = f"%{title_like}%"
+            where.append(
+                "(sd.title like ? or td.title like ? or sd.path like ? or td.path like ? or r.evidence like ?)"
+            )
+            params.extend([like, like, like, like, like])
+        for term in query_terms:
+            like = f"%{term}%"
+            where.append(
+                "(sd.title like ? or td.title like ? or sd.category like ? or td.category like ? or r.evidence like ?)"
+            )
+            params.extend([like, like, like, like, like])
+
+        sql = f"""
+            select r.relation_id, r.source_document_id, r.target_document_id,
+                   r.relation_type, r.confidence, r.evidence, r.method, r.metadata,
+                   sd.title as source_title, sd.path as source_path,
+                   sd.category as source_category, sd.agency as source_agency,
+                   sd.doc_type as source_doc_type, sd.date_text as source_date_text,
+                   sd.char_count as source_char_count,
+                   td.title as target_title, td.path as target_path,
+                   td.category as target_category, td.agency as target_agency,
+                   td.doc_type as target_doc_type, td.date_text as target_date_text,
+                   td.char_count as target_char_count
+            from document_relations r
+            join documents sd on sd.document_id = r.source_document_id
+            join documents td on td.document_id = r.target_document_id
+            where {' and '.join(where)}
+            order by r.confidence desc, r.relation_type
+            limit 5000
+        """
+        return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+    def _load_path_relation_rows(self, conn: sqlite3.Connection,
+                                 *,
+                                 wanted_types: list[str]) -> list[sqlite3.Row]:
+        where = []
+        params: list[Any] = []
+        if wanted_types:
+            placeholders = ",".join("?" for _ in wanted_types)
+            where.append(f"r.relation_type in ({placeholders})")
+            params.extend(wanted_types)
+        else:
+            where.append("r.relation_type not in ('topically_related', 'semantically_related')")
+        sql = f"""
+            select r.relation_id, r.source_document_id, r.target_document_id,
+                   r.relation_type, r.confidence, r.evidence, r.method, r.metadata,
+                   sd.title as source_title, sd.path as source_path,
+                   sd.category as source_category, sd.agency as source_agency,
+                   sd.doc_type as source_doc_type, sd.date_text as source_date_text,
+                   sd.char_count as source_char_count,
+                   td.title as target_title, td.path as target_path,
+                   td.category as target_category, td.agency as target_agency,
+                   td.doc_type as target_doc_type, td.date_text as target_date_text,
+                   td.char_count as target_char_count
+            from document_relations r
+            join documents sd on sd.document_id = r.source_document_id
+            join documents td on td.document_id = r.target_document_id
+            where {' and '.join(where)}
+            order by r.confidence desc
+        """
+        return conn.execute(sql, params).fetchall()
+
+    def _load_graph_relation_rows(self, conn: sqlite3.Connection,
+                                  *,
+                                  wanted_types: list[str],
+                                  query_terms: list[str],
+                                  min_confidence: float,
+                                  max_edges: int) -> list[dict[str, Any]]:
+        where = ["r.confidence >= ?"]
+        params: list[Any] = [min_confidence]
+        if wanted_types:
+            placeholders = ",".join("?" for _ in wanted_types)
+            where.append(f"r.relation_type in ({placeholders})")
+            params.extend(wanted_types)
+        for term in query_terms:
+            like = f"%{term}%"
+            where.append(
+                "(sd.title like ? or td.title like ? or sd.category like ? or td.category like ? or r.evidence like ?)"
+            )
+            params.extend([like, like, like, like, like])
+        sql = f"""
+            select r.relation_id, r.source_document_id, r.target_document_id,
+                   r.relation_type, r.confidence, r.evidence, r.method,
+                   sd.title as source_title, sd.path as source_path,
+                   sd.category as source_category, sd.agency as source_agency,
+                   sd.doc_type as source_doc_type, sd.date_text as source_date_text,
+                   sd.char_count as source_char_count,
+                   td.title as target_title, td.path as target_path,
+                   td.category as target_category, td.agency as target_agency,
+                   td.doc_type as target_doc_type, td.date_text as target_date_text,
+                   td.char_count as target_char_count
+            from document_relations r
+            join documents sd on sd.document_id = r.source_document_id
+            join documents td on td.document_id = r.target_document_id
+            where {' and '.join(where)}
+            order by r.confidence desc
+            limit ?
+        """
+        return [dict(row) for row in conn.execute(sql, [*params, max_edges]).fetchall()]
+
     def _parse_document(self, path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         text = path.read_text(encoding="utf-8", errors="ignore")
         rel_path = path.relative_to(self.paths.repo_root).as_posix()
@@ -1972,20 +2328,6 @@ class DocumentIndex:
 
         with self._connect() as conn:
             if clean_query:
-                like_sql = f"""
-                    select c.*, d.title, d.path, d.category, d.agency, d.doc_type
-                    from chunks c join documents d using (document_id)
-                    where ({where_sql})
-                      and (c.content like ? or c.heading like ? or d.title like ? or d.path like ?)
-                    limit ?
-                """
-                like_value = f"%{clean_query}%"
-                for row in conn.execute(
-                    like_sql,
-                    [*params, like_value, like_value, like_value, like_value, limit * 4],
-                ):
-                    self._add_candidate(candidates, dict(row), 20.0, clean_query)
-
                 match = build_fts_query(clean_query)
                 if match:
                     fts_sql = f"""
@@ -2003,17 +2345,25 @@ class DocumentIndex:
                         score = 12.0 + max(0.0, 8.0 - abs(float(row["rank"])))
                         self._add_candidate(candidates, dict(row), score, clean_query)
 
-                for token in tokenize_query(clean_query):
-                    token_like = f"%{token}%"
-                    token_sql = f"""
+                title_terms = [clean_query, *tokenize_query(clean_query)]
+                for term in title_terms[:8]:
+                    if not term:
+                        continue
+                    title_like = f"%{term}%"
+                    title_sql = f"""
                         select c.*, d.title, d.path, d.category, d.agency, d.doc_type
-                        from chunks c join documents d using (document_id)
+                        from documents d
+                        join chunks c on c.document_id = d.document_id
                         where ({where_sql})
-                          and (c.content like ? or d.title like ?)
+                          and (d.title like ? or d.path like ?)
+                        order by d.path, c.ordinal
                         limit ?
                     """
-                    for row in conn.execute(token_sql, [*params, token_like, token_like, limit * 2]):
-                        self._add_candidate(candidates, dict(row), 4.0, clean_query)
+                    for row in conn.execute(title_sql, [*params, title_like, title_like, limit * 2]):
+                        self._add_candidate(candidates, dict(row), 8.0, clean_query)
+
+                for row in self._anchored_like_recall(conn, clean_query, where_sql, params, limit):
+                    self._add_candidate(candidates, row, 16.0, clean_query)
 
                 if semantic:
                     for row in self._semantic_recall_chunks(clean_query, filters, params, limit):
@@ -2031,11 +2381,37 @@ class DocumentIndex:
 
         return sorted(candidates.values(), key=lambda r: (-r["score"], r["path"], r["ordinal"]))
 
+    def _anchored_like_recall(self, conn: sqlite3.Connection,
+                              query: str,
+                              where_sql: str,
+                              params: list[Any],
+                              limit: int) -> list[dict[str, Any]]:
+        anchors = anchored_like_terms(query)
+        if len(anchors) < 2:
+            return []
+        clauses = []
+        like_params: list[Any] = []
+        for term in anchors[:4]:
+            clauses.append("(c.content like ? or c.heading like ? or d.title like ? or d.path like ?)")
+            like = f"%{term}%"
+            like_params.extend([like, like, like, like])
+        sql = f"""
+            select c.*, d.title, d.path, d.category, d.agency, d.doc_type
+            from chunks c join documents d using (document_id)
+            where ({where_sql}) and {' and '.join(clauses)}
+            order by d.path, c.ordinal
+            limit ?
+        """
+        return [dict(row) for row in conn.execute(sql, [*params, *like_params, max(limit * 2, 20)]).fetchall()]
+
     def _semantic_recall_chunks(self, query: str, filters: list[str],
                                 params: list[Any], limit: int) -> list[dict[str, Any]]:
         config = self.embedding_config
         if not query or not config.enabled or config.provider not in {"openai", "local"}:
             return []
+        faiss_hits = self._semantic_recall_chunks_faiss(query, filters, params, limit)
+        if faiss_hits:
+            return faiss_hits
         try:
             with self._connect() as conn:
                 embedded_count = conn.execute(
@@ -2082,6 +2458,59 @@ class DocumentIndex:
 
         return sorted(
             scored,
+            key=lambda item: (-float(item.get("semantic_score", 0.0)), item.get("path", ""), item.get("ordinal", 0)),
+        )[:max(1, min(limit, 240))]
+
+    def _semantic_recall_chunks_faiss(self, query: str, filters: list[str],
+                                      params: list[Any], limit: int) -> list[dict[str, Any]]:
+        if np is None:
+            return []
+        faiss = load_faiss()
+        if faiss is None:
+            return []
+        if not self.paths.faiss_index_path.exists() or not self.paths.faiss_meta_path.exists():
+            return []
+        try:
+            meta = json.loads(self.paths.faiss_meta_path.read_text(encoding="utf-8"))
+            if meta.get("model") != self.embedding_config.model:
+                return []
+            chunk_ids = meta.get("chunk_ids") or []
+            index = faiss.read_index(str(self.paths.faiss_index_path))
+            query_vector = np.asarray([self._embed_query(query)], dtype="float32")
+            recall_k = min(max(limit * 12, 80), len(chunk_ids))
+            scores, indexes = index.search(query_vector, recall_k)
+        except Exception:
+            return []
+
+        candidates = []
+        for score, vector_index in zip(scores[0].tolist(), indexes[0].tolist(), strict=True):
+            if vector_index < 0 or vector_index >= len(chunk_ids):
+                continue
+            if float(score) < self.embedding_config.min_similarity:
+                continue
+            candidates.append((chunk_ids[vector_index], float(score)))
+        if not candidates:
+            return []
+
+        score_by_chunk = {chunk_id: score for chunk_id, score in candidates}
+        placeholders = ",".join("?" for _chunk_id, _score in candidates)
+        where_sql = " and ".join(filters) if filters else "1=1"
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                select c.*, d.title, d.path, d.category, d.agency, d.doc_type
+                from chunks c join documents d using (document_id)
+                where c.chunk_id in ({placeholders}) and {where_sql}
+                """,
+                [*[chunk_id for chunk_id, _score in candidates], *params],
+            ).fetchall()
+        hits = []
+        for row in rows:
+            item = dict(row)
+            item["semantic_score"] = round(score_by_chunk.get(row["chunk_id"], 0.0), 4)
+            hits.append(item)
+        return sorted(
+            hits,
             key=lambda item: (-float(item.get("semantic_score", 0.0)), item.get("path", ""), item.get("ordinal", 0)),
         )[:max(1, min(limit, 240))]
 
@@ -2306,10 +2735,17 @@ class DocumentIndex:
         existing = candidates.get(chunk_id)
         if existing:
             existing["score"] += score
+            if row.get("semantic_score"):
+                existing["semantic_score"] = max(
+                    float(existing.get("semantic_score", 0.0) or 0.0),
+                    float(row.get("semantic_score", 0.0) or 0.0),
+                )
+            existing["recall_sources"] = sorted(set(existing.get("recall_sources", ["lexical"])) | {"lexical"})
             return
         content = row.get("content", "") or ""
         row["score"] = round(score, 3)
         row["snippet"] = make_snippet(content, query)
+        row["recall_sources"] = ["lexical"]
         row["source"] = {
             "title": row.get("title", ""),
             "path": row.get("path", ""),
@@ -3707,6 +4143,44 @@ def format_relation_row(row: sqlite3.Row, focus_document_id: str = "") -> dict[s
         "target_chunk_id": row["target_chunk_id"],
         "metadata": metadata,
     }
+
+
+def parse_relation_types(value: str) -> list[str]:
+    return [
+        item.strip()
+        for item in (value or "").split(",")
+        if item.strip()
+    ]
+
+
+def summarize_recall_sources(hits: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for hit in hits:
+        sources = hit.get("recall_sources") or []
+        if not sources:
+            sources = ["unknown"]
+        for source in sources:
+            counts[source] = counts.get(source, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def anchored_like_terms(query: str) -> list[str]:
+    tokens = tokenize_query(query)
+    anchors = []
+    if any(term in query for term in ("批示", "批办", "交办")):
+        anchors.append("批示" if "批示" in query else ("批办" if "批办" in query else "交办"))
+    for token in tokens:
+        if token in {"查询", "一下", "所有", "文件", "材料", "相关"}:
+            continue
+        if re.fullmatch(r"20\d{2}", token):
+            continue
+        if token in anchors:
+            continue
+        if len(token) >= 3 or token.endswith(("局", "委", "办")):
+            anchors.append(token)
+    if "批示" in anchors:
+        anchors = ["批示" if item == "批示" else item for item in anchors]
+    return anchors[:4]
 
 
 def tokenize_for_search(text: str) -> str:
