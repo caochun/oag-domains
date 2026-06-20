@@ -145,6 +145,10 @@ class DocumentPaths:
     def faiss_meta_path(self) -> Path:
         return self.derived_dir / "chunk_embeddings.faiss.json"
 
+    def document_path_id(self, path: Path) -> str:
+        """Stable path stored in the index, independent from corpus mount location."""
+        return (Path(self.corpus_root.name) / path.relative_to(self.corpus_root)).as_posix()
+
 def resolve_paths(domain_dir: Path) -> DocumentPaths:
     repo_root = domain_dir.resolve().parents[1]
     corpus_root = Path(os.getenv("DOCUMENT_QA_ROOT", repo_root / "documents_mineru")).resolve()
@@ -302,7 +306,7 @@ class DocumentIndex:
 
         md_files = self._markdown_files()
         current_by_path = {
-            path.relative_to(self.paths.repo_root).as_posix(): path
+            self.paths.document_path_id(path): path
             for path in md_files
         }
 
@@ -1887,7 +1891,7 @@ class DocumentIndex:
 
     def _parse_document(self, path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         text = path.read_text(encoding="utf-8", errors="ignore")
-        rel_path = path.relative_to(self.paths.repo_root).as_posix()
+        rel_path = self.paths.document_path_id(path)
         rel_to_corpus = path.relative_to(self.paths.corpus_root)
         parts = rel_to_corpus.parts
         category = "/".join(parts[:-3]) if len(parts) >= 3 and parts[-2] == "auto" else "/".join(parts[:-1])
@@ -1953,7 +1957,7 @@ class DocumentIndex:
             rel_to_corpus = path.relative_to(self.paths.corpus_root)
             if not rel_to_corpus.parts or rel_to_corpus.parts[0] not in DEFAULT_EXCLUDED_TOP_LEVEL_DIRS:
                 continue
-            rel_path = path.relative_to(self.paths.repo_root).as_posix()
+            rel_path = self.paths.document_path_id(path)
             title = path.stem
             candidates.append({
                 "path": path,
@@ -2340,84 +2344,3 @@ class DocumentResolver:
     def search_text(self, keyword: str, object_types: list[str] | None = None,
                     limit: int = 20) -> list[dict[str, Any]]:
         return self.index.search_text(keyword, limit)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
