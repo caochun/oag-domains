@@ -1,5 +1,5 @@
 name: document_qa
-description: "本地 MinerU Markdown 文档库问答。回答文档内容、某人/机构/关键词相关内容、出现位置、涉及事项、跨文档综合问题时，应优先使用本领域工具而不是通用 search。关键词/出现位置用 search_documents；单篇核对用 read_document；围绕已知文档找上下游关系用 find_document_relations 或 expand_document_context；没有 seed 文档、要全库找相互有关公文组时用 find_document_relation_groups；需要从某篇文档出发找多跳链路或两篇文档之间的关系路径时用 find_document_relation_paths；需要发现关系网络核心文档、社区/模块时用 analyze_document_graph；多文档综合归纳用 prepare_answer_context。回答必须提供可追溯出处。"
+description: "本地 MinerU Markdown 文档库问答。回答文档内容、某人/机构/关键词相关内容、出现位置、涉及事项、跨文档综合问题时，应优先使用本领域工具而不是通用 search。工具选择按用户想要的产物区分：资料定位用 search_documents，单篇核验用 read_document，多文档证据包和综合答案用 prepare_answer_context，已知文档的上下游关系用 find_document_relations 或 expand_document_context，全库关系组/路径/网络分析用 find_document_relation_groups、find_document_relation_paths、analyze_document_graph。若用户要的是“哪些文档/哪里提到/给出处/相关片段”，优先定位；若用户要的是“答案本身”，并需要归纳分类、比较、趋势判断或形成结论，应准备证据包后作答。回答必须提供可追溯出处。"
 tool_preferences:
   generic_search: fallback_only
 excluded_tools:
@@ -111,8 +111,8 @@ links:
 functions:
   search_documents:
     summary: "检索本地文档库，返回轻量证据片段"
-    description: "按关键词、标题、类别、机关、文档类型等条件检索正式 Markdown 文档片段，适合快速定位提及位置和候选文档。正文召回优先使用 SQLite FTS；semantic=true 时使用 FAISS 向量索引做 chunk embedding 召回，若索引不存在才退回慢速扫描。"
-    usage_prompt: "当用户询问某个人名、机构名、事项名、文号或关键词“出现在哪里、涉及哪些文档、有哪些提及、相关片段”时，优先调用本工具。它只返回片段和候选文档，不能代替原文阅读；需要回答具体内容、上下文、事项经过或形成结论时，必须继续用 read_document 读取代表性命中 chunk_id 或 document_id 后再回答。汇总、梳理、比较、年度范围、政策要求、多文档综合类问题优先调用 prepare_answer_context，不要只靠 search_documents 作答。回答中引用 title/path/heading 或 chunk_id。"
+    description: "按关键词、标题、类别、机关、文档类型等条件检索正式 Markdown 文档片段，用于快速定位提及位置、出处和候选文档。它的产物是候选片段列表，不是完整证据包，也不是综合答案。正文召回优先使用 SQLite FTS；semantic=true 时使用 FAISS 向量索引做 chunk embedding 召回，若索引不存在才退回慢速扫描。"
+    usage_prompt: "当用户想要资料定位时调用本工具，例如“哪些文档提到 X”“X 出现在哪里”“有哪些相关片段/出处/引用”“先搜一下 X”。如果用户明确要的是文档清单、命中位置或候选材料，本工具可以作为最终结果；如果用户要的是答案本身，且需要归纳分类、比较、解释原因、总结趋势、判断问题或形成结论，不要仅凭本工具结果作答，应继续调用 read_document 核验代表性文档，或调用 prepare_answer_context 准备多文档证据包。回答中引用 title/path/heading 或 chunk_id。"
     function_type: lookup
     involves_objects: [Document, DocumentChunk]
     params:
@@ -251,7 +251,7 @@ functions:
   prepare_answer_context:
     summary: "为多文档综合问答准备证据材料包"
     description: "围绕用户问题进行全库召回、文档去重排序、KB 关系扩展、核心文档读取，并返回时间属性、抽取质量、证据内容和回答提示。适合需要多篇文档共同支撑的综合回答。"
-    usage_prompt: "当用户要求汇总、梳理、总结、比较、归纳政策要求、分析变化、按时间范围综合材料，或需要跨多篇文档形成结论时，优先调用本工具。用户只是要求列出文档清单时用 list_documents 或 search_documents；用户只是问关键词出现位置时用 search_documents；用户围绕某一篇文档找上下游时用 find_document_relations 或 expand_document_context。回答必须基于 documents[].content 综合；先看 strict_answer_constraints、temporal_coverage、synthesis_outline 和 evidence_outline，不能声称覆盖 found_years 之外的年份。不要按命中文档逐篇堆摘要；若 synthesis_outline.recommended_answer_sections 非空，应优先把这些 section 作为一级归纳框架，再把多篇文档证据归并到相应维度下。若多篇文档支持同一结论，应合并表述并列代表性出处；若证据之间适用对象、时间或口径不同，应说明差异。若 missing_years 或 quality_notes 提示覆盖不足/质量低，必须说明限制。"
+    usage_prompt: "当用户要的是可直接回答问题的多文档证据包，而不是文档/片段列表时调用本工具。适用场景包括：汇总、梳理、总结、比较、归纳政策要求、分析变化、按时间范围综合材料，或围绕产业、行业、企业类型、政策措施、问题、原因、影响、趋势、历年情况等形成分类和结论。如果用户明确说“搜相关文档/给出处/有哪些文档提到”，则用 search_documents 或 list_documents。用户围绕某一篇文档找上下游时用 find_document_relations 或 expand_document_context。默认 mode=brief 返回短证据摘录 documents[].excerpts 和文档引用，适合直接回答；只有需要更多原文上下文时才使用 mode=evidence 或 read_document。回答必须基于 documents[].excerpts 或 mode=evidence 下的 documents[].content 综合；先看 strict_answer_constraints、temporal_coverage、synthesis_outline 和 evidence_outline，不能声称覆盖 found_years 之外的年份。不要按命中文档逐篇堆摘要；若 synthesis_outline.recommended_answer_sections 非空，应优先把这些 section 作为一级归纳框架，再把多篇文档证据归并到相应维度下。若多篇文档支持同一结论，应合并表述并列代表性出处；若证据之间适用对象、时间或口径不同，应说明差异。若 missing_years 或 quality_notes 提示覆盖不足/质量低，必须说明限制。"
     function_type: lookup
     involves_objects: [Document, DocumentChunk, DocumentRelation]
     params:
@@ -259,6 +259,7 @@ functions:
       limit_docs: {type: int, description: "读取核心文档数量，默认6，最多12", default: 6}
       max_chars_per_doc: {type: int, description: "每篇核心文档最多读取字符数，默认4000", default: 4000}
       include_relations: {type: bool, description: "是否使用文档 KB 关系扩展候选材料，默认 true", default: true}
+      mode: {type: str, description: "返回模式：brief 默认短证据摘录；evidence 返回更多原文 content", default: "brief"}
       debug: {type: bool, description: "是否返回更多检索调试信息，默认 false", default: false}
 
   rebuild_document_index:

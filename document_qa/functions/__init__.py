@@ -104,6 +104,7 @@ def register(registry: FunctionRegistry, store: ObjectRepository, ontology: Onto
             limit_docs=kw.get("limit_docs", 6) or 6,
             max_chars_per_doc=kw.get("max_chars_per_doc", 4000) or 4000,
             include_relations=kw.get("include_relations", True),
+            mode=kw.get("mode", "brief") or "brief",
             debug=kw.get("debug", False),
         ),
         "rebuild_document_index": lambda **kw: index.rebuild(

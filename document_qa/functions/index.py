@@ -108,6 +108,7 @@ from .text_processing import (
     document_kb_signature,
     document_quality,
     document_temporal_metadata,
+    expected_years_from_query,
     extract_doc_numbers,
     extract_quoted_terms,
     extract_seed_terms,
@@ -120,8 +121,10 @@ from .text_processing import (
     kind_score_multiplier,
     length_bonus,
     rerank_base_component,
+    split_read_content_blocks,
     split_markdown_chunks,
     stable_id,
+    tokenize_terms,
     top_weighted_terms,
     tokenize_query,
 )
@@ -1029,6 +1032,7 @@ class DocumentIndex:
     def prepare_answer_context(self, *, query: str, limit_docs: int = 6,
                                max_chars_per_doc: int = 4000,
                                include_relations: bool = True,
+                               mode: str = "brief",
                                debug: bool = False) -> dict[str, Any]:
         self.ensure()
         clean_query = (query or "").strip()
@@ -1037,6 +1041,9 @@ class DocumentIndex:
         limit_docs = max(1, min(int(limit_docs or 6), 12))
         max_chars_per_doc = max(1200, min(int(max_chars_per_doc or 4000), 12000))
         include_relations = coerce_bool(include_relations)
+        mode = (mode or "brief").strip().lower()
+        if mode not in {"brief", "evidence"}:
+            mode = "brief"
         debug = coerce_bool(debug)
         expected_years = expected_years_from_query(clean_query)
         search_limit = min(max(limit_docs * 5, 18), 30)
@@ -1189,8 +1196,18 @@ class DocumentIndex:
             "KB 关系用于补充上下文，不替代 read_document 证据。",
         ]
         strict_constraints = build_strict_answer_constraints(temporal_coverage)
-        return {
+        synthesis_outline = build_synthesis_outline(clean_query, evidence_documents)
+        evidence_outline = build_evidence_outline(evidence_documents)
+        quality_notes = build_quality_notes(evidence_documents)
+        compact_documents = [
+            self._compact_evidence_document(doc)
+            for doc in evidence_documents
+        ]
+        full_documents_available = mode != "evidence" and not debug
+        result = {
             "query": clean_query,
+            "mode": mode,
+            "compact": full_documents_available,
             "strict_answer_constraints": strict_constraints,
             "workflow": [
                 "search_documents(rerank=true)",
@@ -1203,15 +1220,50 @@ class DocumentIndex:
                 "count": search_result.get("count", 0),
                 "candidate_limit": search_limit,
                 "relation_seed_limit": relation_seed_limit if include_relations else 0,
-                "query_terms": search_result.get("query_terms", []),
             },
             "temporal_coverage": temporal_coverage,
             "answer_guidance": answer_guidance,
-            "synthesis_outline": build_synthesis_outline(clean_query, evidence_documents),
-            "evidence_outline": build_evidence_outline(evidence_documents),
-            "quality_notes": build_quality_notes(evidence_documents),
+            "synthesis_outline": synthesis_outline,
+            "evidence_outline": evidence_outline,
+            "quality_notes": quality_notes,
             "kb_relations_used": relation_suggestions_used if include_relations else [],
-            "documents": evidence_documents,
+            "documents": evidence_documents if not full_documents_available else compact_documents,
+        }
+        if full_documents_available:
+            result["full_content_hint"] = (
+                "默认仅返回短证据摘录。需要核对全文或更多上下文时，"
+                "请使用 documents[].document.document_id 调用 read_document，"
+                "或用 mode='evidence' 重新调用本工具。"
+            )
+        else:
+            result["search"]["query_terms"] = search_result.get("query_terms", [])
+        return result
+
+    def _compact_evidence_document(self, doc: dict[str, Any]) -> dict[str, Any]:
+        content = doc.get("content", "") or ""
+        excerpts = []
+        for block in split_read_content_blocks(content):
+            text = " ".join((block.get("text", "") or "").split())
+            if not text:
+                continue
+            excerpts.append({
+                "heading": block.get("heading", ""),
+                "text": text[:700],
+            })
+            if len(excerpts) >= 2:
+                break
+        return {
+            "document": doc.get("document", {}),
+            "selection": {
+                "reason": doc.get("selection", {}).get("reason", ""),
+                "search_hit_count": doc.get("selection", {}).get("search_hit_count", 0),
+            },
+            "temporal": doc.get("temporal", {}),
+            "quality": doc.get("quality", {}),
+            "included_chunk_ids": doc.get("included_chunk_ids", [])[:3],
+            "excerpts": excerpts,
+            "truncated": doc.get("truncated", False),
+            "content_omitted": True,
         }
 
     def query_rows(self, object_type: str, filters: dict[str, Any] | None = None,

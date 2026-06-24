@@ -7,3 +7,8 @@ tools/.env
 hv_access/builder_runs/
 hv_access/scout*_run_*/
 hv_access/ontology_builder_*.yaml
+
+# Generated domain corpora, indexes and extraction outputs
+*/raw/
+*/docs_md/
+*/.substation_kb/
