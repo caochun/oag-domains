@@ -1,336 +1,258 @@
 name: substation
-description: "±800kV 泰州换流站运行事件诊断与直流控保文档问答领域。面向同站连续事件链、SER/告警、自动功率升降、阀冷、VCE/阀组控制、直流站控、交流站控、故障录波等运行事件，结合现场运行规程、典型操作票、设备概况、异常故障处理预案、控制保护系统设计规范、定值单和运行图册，形成可追溯的事件链解释、异常判断和处置建议。回答必须区分用户提供的事件事实、文档依据、推断结论和不确定项。"
+description: "换流站运行事件链研判和专业文档问答领域。面向站内连续事件、告警、保护动作、故障穿越、阀冷、站用电、录波、控保切换和专业术语解释等场景，输出结构化结论和可追溯证据。回答必须区分用户提供的事件事实、文档依据和智能体推断；面向用户的最终回答不得暴露工具调用过程、工作流步骤、内部错误、自检文字或“已确认回复完整”。工具选择原则：事件链总结/异常性研判优先 assess_substation_event_chain；根据文档回答、术语解释、现象含义和处置依据优先 prepare_substation_answer_context；资料定位才用 search_substation_evidence；需要核对原文上下文才用 read_substation_evidence。不要把未在事件事实或文档中出现的状态说成已发生。"
 
 tool_preferences:
   generic_search: fallback_only
+
 excluded_tools:
-  - mutate
-  - dispatch_workers
+  - start_workflow
+  - apply_rule
+  - apply_rule_batch
 
 objects:
-  HvdcDocument:
-    kind: entity
-    data_source: external_api
-    mutability: read_only
-    source:
-      type: resolver
-      resolver: substation_document_index
-      id_field: document_id
-      config: {root: domains/substation/docs_md}
-    summary: "换流站专业文档"
-    description: "来自 domains/substation/docs_md 的 Markdown 文档，包括运行规程、运行图册、控制保护系统设计规范和定值单。文档是回答的主要证据来源，不等同于实时运行事实。"
-    properties:
-      document_id: {type: str, required: true, description: "稳定文档ID，如 000020_77ab4e8a6fc9"}
-      title: {type: str, description: "文档标题或原始文件名"}
-      category: {type: str, description: "文档类别: 运行规程/直流控制系统产品说明书/定值单"}
-      source_path: {type: str, description: "原始 PDF 相对路径"}
-      md_path: {type: str, description: "Markdown 路径"}
-      pages: {type: int, description: "原 PDF 页数"}
-      doc_role: {type: str, description: "文档角色: equipment_overview/operation_rule/operation_ticket/emergency_procedure/control_protection_spec/setting_sheet/diagram_atlas"}
-
-  DocumentChunk:
-    kind: entity
-    data_source: external_api
-    mutability: read_only
-    source:
-      type: resolver
-      resolver: substation_document_index
-      id_field: chunk_id
-    summary: "文档证据片段"
-    description: "按标题、段落或图文邻近关系切分的证据片段。回答事件链时必须引用具体 chunk 或文档章节；不能只给泛泛结论。"
-    properties:
-      chunk_id: {type: str, required: true, description: "稳定片段ID"}
-      document_id: {type: str, description: "所属文档ID"}
-      heading: {type: str, description: "片段所在标题层级"}
-      content: {type: str, description: "片段文本"}
-      image_refs: {type: str, description: "片段关联图片路径，逗号分隔"}
-      evidence_role: {type: str, description: "证据作用: definition/normal_behavior/abnormal_symptom/handling_rule/operation_step/diagram/setting"}
-
-  DocumentFigure:
-    kind: entity
-    data_source: external_api
-    mutability: read_only
-    source:
-      type: resolver
-      resolver: substation_document_index
-      id_field: figure_id
-    summary: "图纸、截图或扫描页"
-    description: "运行图册、保护原理图、控制原理图、屏位布置图、定值单扫描页等图片资产。涉及接线图、原理图、定值单时应引用图片路径。"
-    properties:
-      figure_id: {type: str, required: true, description: "稳定图片ID"}
-      document_id: {type: str, description: "所属文档ID"}
-      path: {type: str, description: "图片文件路径"}
-      caption: {type: str, description: "图题或邻近标题"}
-      width: {type: int, description: "图片宽度"}
-      height: {type: int, description: "图片高度"}
-      figure_type: {type: str, description: "图类型: wiring_diagram/protection_logic/control_logic/layout/setting_scan/other"}
-
   StationEvent:
     kind: event
     data_source: user_provided
     mutability: append_only
+    summary: "站内连续事件"
+    description: "用户提供的二级/三级事件、SER、告警或操作记录。"
     source:
       type: runtime_memory
       id_field: event_id
-    summary: "站内运行事件"
-    description: "用户输入的三级/二级事件、SER、告警或操作记录。它是本次分析事实源，需保留时间、站点、设备、事件类型、摘要和告警等级。"
     properties:
-      event_id: {type: str, required: true, description: "事件编号，可由输入顺序生成"}
-      station_name: {type: str, description: "站点，如 泰州站"}
-      device_name: {type: str, description: "设备或系统名称，如 直流站控系统/极2高端阀冷系统"}
-      subsystem: {type: str, description: "归一化子系统: dc_station_control/ac_station_control/valve_cooling/vce/valve_group_control/auxiliary_system/protection_recorder"}
-      event_type: {type: str, description: "事件类型，如 自动功率升降/阀冷相关操作/辅助系统信息"}
-      start_time: {type: str, description: "开始时间，ISO 或原始文本"}
-      end_time: {type: str, description: "结束时间，ISO 或原始文本"}
-      duration_seconds: {type: float, description: "持续秒数"}
-      level: {type: int, description: "告警等级或事件等级"}
-      summary: {type: str, description: "原始二级摘要"}
-      nature: {type: str, description: "事件性质，若原始输入为空则保留为空"}
+      event_id: {type: str, required: true, description: "事件编号"}
+      station_name: {type: str, description: "站点名称"}
+      device_name: {type: str, description: "设备或系统名称"}
+      event_type: {type: str, description: "事件类型"}
+      start_time: {type: str, description: "开始时间"}
+      end_time: {type: str, description: "结束时间"}
+      alarm_level: {type: int, description: "告警等级"}
+      summary: {type: str, description: "二级摘要"}
+      event_nature_text: {type: str, description: "原始事件性质"}
+      subsystems: {type: str, description: "归一化子系统"}
+      raw_text: {type: str, description: "用户输入中的原始事件片段；字段抽取不完整时作为主要事实源"}
+      parse_quality: {type: str, description: "字段抽取质量: high/medium/low/raw"}
 
   EventChain:
     kind: event
     data_source: user_provided
     mutability: append_only
+    summary: "同站连续事件链"
+    description: "按时间组织的一组连续事件，用于研判主事件、伴随事件和异常信号。"
     source:
       type: runtime_memory
       id_field: chain_id
-    summary: "同站连续事件链"
-    description: "多个 StationEvent 按时间、站点、设备、系统耦合关系组成的一段候选事件链。用于判断是否是正常操作序列、伴随现象、扰动、异常或需要人工复核。"
     properties:
-      chain_id: {type: str, required: true, description: "事件链编号"}
-      station_name: {type: str, description: "站点"}
-      window_start: {type: str, description: "事件链开始时间"}
-      window_end: {type: str, description: "事件链结束时间"}
-      primary_event_type: {type: str, description: "主导事件类型，如 自动功率升降"}
-      involved_subsystems: {type: str, description: "涉及子系统，逗号分隔"}
+      chain_id: {type: str, required: true, description: "链编号"}
+      station_name: {type: str, description: "站点名称"}
+      window_start: {type: str, description: "开始时间"}
+      window_end: {type: str, description: "结束时间"}
       event_count: {type: int, description: "事件数量"}
-      chain_summary: {type: str, description: "事件链归纳摘要"}
+      involved_subsystems: {type: str, description: "涉及子系统"}
 
-  EventInterpretation:
+  EventConclusion:
     kind: entity
     data_source: agent_generated
     mutability: append_only
+    summary: "事件链结构化结论"
+    description: "智能体对事件链的最终结构化结论，包含描述、类型、性质、风险等级和理由。"
     source:
       type: runtime_memory
-      id_field: interpretation_id
-    summary: "事件链解释与异常判断"
-    description: "智能体对 EventChain 的结构化分析结果。必须标明结论、依据、置信度、是否需要人工复核以及还缺什么运行量。"
+      id_field: conclusion_id
     properties:
-      interpretation_id: {type: str, required: true, description: "解释结果编号"}
-      chain_id: {type: str, description: "事件链编号"}
-      narrative: {type: str, description: "按时间线描述发生了什么"}
-      main_cause_hypothesis: {type: str, description: "主因假设，如 调度/自动功率控制引发的正常功率调节过程"}
-      anomaly_judgement: {type: str, description: "判断: 正常/可能正常/可疑/异常/证据不足"}
-      judgement_reason: {type: str, description: "判断理由"}
-      confidence: {type: float, description: "置信度 0-1"}
-      required_checks: {type: str, description: "建议补充核查项，如 功率曲线/阀冷水温流量/录波启动原因/保护动作出口"}
-      evidence_refs: {type: str, description: "引用的文档、章节、chunk 或图片路径"}
+      conclusion_id: {type: str, required: true, description: "结论编号"}
+      event_description: {type: str, required: true, description: "事件描述"}
+      event_type: {type: str, required: true, description: "事件类型"}
+      event_nature: {type: str, required: true, description: "事件性质"}
+      risk_level: {type: str, required: true, description: "风险等级"}
+      reason: {type: str, required: true, description: "结论理由"}
+      observed_facts: {type: "list[dict]", description: "从用户事件链抽取的观测事实，不包含文档推断"}
+      abnormal_triggers: {type: "list[dict]", description: "文档或内置规则中用于判断异常的触发条件"}
+      trigger_match: {type: "list[dict]", description: "本次事件事实对每个异常触发条件的命中情况"}
+      evidence_refs: {type: "list[dict]", description: "支撑结论的文档证据引用，包含 chunk_id、title、heading、doc_role 和 evidence_role"}
+      evidence_summary: {type: str, description: "用于回答展示的证据摘要"}
 
-  HvdcSystem:
+  SubstationDocument:
     kind: entity
-    data_source: human_confirmed
-    mutability: read_only
-    source:
-      type: json_file
-      id_field: system_id
-      config: {path: data/hvdc_systems.json}
-    summary: "换流站系统或子系统"
-    description: "站内专业系统归一化字典，用于把事件中的设备名映射到直流站控、极控、阀组控制、阀冷、交流站控、站用电、故障录波等。"
-    properties:
-      system_id: {type: str, required: true, description: "系统编号"}
-      name: {type: str, description: "系统名称"}
-      aliases: {type: str, description: "别名，逗号分隔"}
-      station_name: {type: str, description: "所属站点"}
-      system_type: {type: str, description: "系统类型"}
-      normal_role: {type: str, description: "运行功能说明"}
-
-  OperationMode:
-    kind: entity
-    data_source: document_derived
+    data_source: external_api
     mutability: read_only
     source:
       type: resolver
-      resolver: substation_document_index
-      id_field: mode_id
-    summary: "直流运行方式和控制模式"
-    description: "双极/单极、功率控制/电流控制、金属回线/大地回线、阀组在线投入退出等运行方式。用于解释自动功率升降、功率回降、运行方式转换。"
+      resolver: substation_event_kb
+      id_field: document_id
+    summary: "换流站专业文档"
+    description: "来自 domains/substation/docs_md 的 Markdown 文档元数据，作为事件链研判的证据来源。"
     properties:
-      mode_id: {type: str, required: true, description: "运行方式编号"}
-      name: {type: str, description: "运行方式名称"}
-      pole: {type: str, description: "极 I/极 II/双极"}
-      control_mode: {type: str, description: "控制模式，如 双极功率控制/单极功率控制/单极电流控制"}
-      source_refs: {type: str, description: "文档证据引用"}
+      document_id: {type: str, required: true, description: "稳定文档ID"}
+      title: {type: str, description: "文档标题"}
+      category: {type: str, description: "文档类别"}
+      source_path: {type: str, description: "原始 PDF 路径"}
+      md_path: {type: str, description: "Markdown 路径"}
+      doc_role: {type: str, description: "文档角色: emergency_procedure/operation_rule/operation_ticket/control_protection_spec/equipment_overview/setting_sheet/document"}
+      char_count: {type: int, description: "正文字符数"}
 
-  EmergencyProcedure:
+  EvidenceChunk:
     kind: entity
-    data_source: document_derived
+    data_source: external_api
     mutability: read_only
     source:
       type: resolver
-      resolver: substation_document_index
-      id_field: procedure_id
-    summary: "异常与故障处理预案"
-    description: "运行规程第五分册中的处理预案，如双极闭锁、极闭锁、阀冷异常、保护装置异常、通信异常、功率升降异常等。"
+      resolver: substation_event_kb
+      id_field: chunk_id
+    summary: "文档证据片段"
+    description: "按标题和段落切分的证据片段，用于定位规程、处理原则、异常信号和图文线索。"
     properties:
-      procedure_id: {type: str, required: true, description: "预案编号"}
-      title: {type: str, description: "预案标题"}
-      symptoms: {type: str, description: "现象或触发条件"}
-      actions: {type: str, description: "处理步骤摘要"}
-      related_systems: {type: str, description: "相关系统"}
-      source_refs: {type: str, description: "文档证据引用"}
-
-  ProtectionRecorderEvent:
-    kind: event
-    data_source: user_provided
-    mutability: append_only
-    source:
-      type: runtime_memory
-      id_field: recorder_event_id
-    summary: "故障录波/录波启动事件"
-    description: "故障录波装置、阀测控机箱录波启动、保护动作报告等事件。录波启动可能是保护动作、扰动、操作或系统联动的伴随现象，不能单独等同于设备故障。"
-    properties:
-      recorder_event_id: {type: str, required: true, description: "录波事件编号"}
-      event_id: {type: str, description: "对应 StationEvent"}
-      recorder_devices: {type: str, description: "涉及录波装置或机箱"}
-      trigger_context: {type: str, description: "触发上下文"}
-      cleared: {type: int, description: "是否已消失: 1/0"}
-
-links:
-  document_chunks:
-    source: HvdcDocument
-    target: DocumentChunk
-    join: {source_key: document_id, target_key: document_id}
-    description: "文档包含证据片段"
-    link_type: contains
-    cardinality: 1..n
-
-  document_figures:
-    source: HvdcDocument
-    target: DocumentFigure
-    join: {source_key: document_id, target_key: document_id}
-    description: "文档包含图纸或扫描页"
-    link_type: contains
-    cardinality: 1..n
-
-  chain_events:
-    source: EventChain
-    target: StationEvent
-    join: {source_key: chain_id, target_key: chain_id}
-    description: "事件链包含具体运行事件"
-    link_type: contains
-    cardinality: 1..n
-
-  event_system:
-    source: StationEvent
-    target: HvdcSystem
-    join: {source_key: subsystem, target_key: system_type}
-    description: "运行事件关联到换流站子系统"
-    link_type: relates
-    cardinality: n..1
-
-  interpretation_chain:
-    source: EventInterpretation
-    target: EventChain
-    join: {source_key: chain_id, target_key: chain_id}
-    description: "解释结果对应事件链"
-    link_type: explains
-    cardinality: n..1
+      chunk_id: {type: str, required: true, description: "稳定片段ID"}
+      document_id: {type: str, description: "所属文档ID"}
+      title: {type: str, description: "所属文档标题"}
+      category: {type: str, description: "文档类别"}
+      md_path: {type: str, description: "Markdown 路径"}
+      heading: {type: str, description: "标题层级"}
+      content: {type: str, description: "片段正文"}
+      evidence_role: {type: str, description: "证据角色: handling_rule/severe_signal/abnormal_signal/normal_operation/event_record/figure_context/definition"}
+      image_refs: {type: str, description: "关联图片路径"}
 
 functions:
-  search_substation_docs:
+  search_substation_evidence:
     summary: "检索换流站专业文档证据"
-    description: "在 domains/substation/docs_md 中按关键词、系统、事件类型、文档类别检索 Markdown 片段和相关图片。用于查找自动功率升降、阀冷、SER、录波、保护动作、运行方式、处理预案等依据。"
-    usage_prompt: "当用户给出运行事件链、问某个系统/告警/操作/保护含义或要求判断是否异常时，先用本工具检索相关文档证据。检索词应包含事件类型、设备名、关键动作和同义词，例如 自动功率升降/功率控制/目标功率、阀冷/内水冷/开关阀/加药泵、录波启动/故障录波/SER/VCE。"
+    description: "按关键词、文档角色和证据角色检索 Markdown 候选片段，返回压缩 snippet 和出处，不返回全文 content。它是资料定位工具，不负责组织最终答案。"
+    usage_prompt: "当需要定位可能相关的文档、章节或 chunk_id 时调用。若用户要的是答案本身，如根据文档回答、解释术语、说明现象含义、判断是否异常或给出处置依据，优先调用 prepare_substation_answer_context；不要为了回答连续裸调用本工具。"
     function_type: lookup
-    involves_objects: [HvdcDocument, DocumentChunk, DocumentFigure]
+    involves_objects: [SubstationDocument, EvidenceChunk]
     params:
-      query: {type: str, description: "关键词或用户问题"}
-      category: {type: str, description: "文档类别过滤，可选", default: ""}
-      doc_role: {type: str, description: "文档角色过滤，可选", default: ""}
-      limit: {type: int, description: "返回证据数量，默认8", default: 8}
-      include_figures: {type: bool, description: "是否返回相关图片，默认 true", default: true}
+      query: {type: str, description: "关键词或问题"}
+      category: {type: str, description: "可选，文档类别过滤", default: ""}
+      doc_role: {type: str, description: "可选，文档角色过滤", default: ""}
+      evidence_role: {type: str, description: "可选，证据角色过滤", default: ""}
+      limit: {type: int, description: "返回数量，默认8", default: 8}
 
-  read_substation_doc:
+  prepare_substation_answer_context:
+    summary: "准备换流站文档问答证据包"
+    description: "围绕用户问题召回、重排并压缩专业文档证据，输出适合直接回答的 evidence、出处、回答约束和证据质量提示。概念解释优先控制保护设计/说明书；异常性、风险和处置判断优先第五分册（设备异常与故障应急处理），控制保护设计文档只作为机制补充。"
+    usage_prompt: "当用户要的是文档驱动的回答本身时优先调用，包括根据文档回答、是什么意思、是什么含义、意味着什么、如何理解、怎么处理、处置依据、总结依据等。调用后直接基于 evidence 和 answer_guidance 回答；只有证据片段明显不完整时才再调用 read_substation_evidence 核验原文。不要在最终回答中暴露 search_plan、工具过程或内部质量检查。"
+    function_type: lookup
+    involves_objects: [SubstationDocument, EvidenceChunk]
+    params:
+      query: {type: str, description: "用户问题"}
+      category: {type: str, description: "可选，站点或文档类别过滤，如 山阳/泰州", default: ""}
+      limit_evidence: {type: int, description: "返回证据条数，默认5", default: 5}
+
+  read_substation_evidence:
     summary: "读取换流站文档上下文"
-    description: "按文档ID、路径、chunk 或标题读取更完整上下文。用于核对检索命中的依据和截取可引用章节。"
-    usage_prompt: "search_substation_docs 返回的证据不足以判断时调用。涉及异常处置、功率升降、阀冷、录波等结论时，应读取对应章节上下文再判断。"
+    description: "按文档ID、路径、chunk 或标题读取更完整上下文，便于核对出处。"
+    usage_prompt: "当 prepare_substation_answer_context 或 search_substation_evidence 命中的片段不够完整，或需要核验某个具体 chunk 的前后文时调用。不要用它代替问答证据包工具。"
     function_type: lookup
-    involves_objects: [HvdcDocument, DocumentChunk, DocumentFigure]
+    involves_objects: [SubstationDocument, EvidenceChunk]
     params:
-      document_id: {type: str, description: "文档ID，可选", default: ""}
-      path: {type: str, description: "Markdown 路径，可选", default: ""}
-      chunk_id: {type: str, description: "片段ID，可选", default: ""}
-      heading: {type: str, description: "标题关键词，可选", default: ""}
-      max_chars: {type: int, description: "最大返回字符数，默认6000", default: 6000}
+      document_id: {type: str, description: "文档ID", default: ""}
+      path: {type: str, description: "Markdown 路径", default: ""}
+      chunk_id: {type: str, description: "片段ID", default: ""}
+      heading: {type: str, description: "标题关键词", default: ""}
+      max_chars: {type: int, description: "最大返回字符数", default: 6000}
 
-  parse_event_chain:
-    summary: "解析用户输入的同站连续事件链"
-    description: "把用户粘贴的三级/二级事件文本解析为 StationEvent 列表，抽取时间、持续时间、站点、设备、事件类型、摘要、告警等级，并按时间排序。"
-    usage_prompt: "当用户输入多条事件并要求总结、判断异常、分析事件链时优先调用。若输入已结构化，也要归一化设备名、子系统和时间重叠关系。"
+  parse_substation_events:
+    summary: "归一化连续事件文本"
+    description: "把用户粘贴的连续事件文本转换为可研判的事件列表。不要假设输入具有固定字段格式；事件边界主要按行文中出现的事件起始时间识别，序号可有可无。工具会尽量弱抽取时间、站点、设备、事件类型、摘要和告警等级，并始终保留 raw_text。字段缺失时 raw_text 是主要事实源。"
+    usage_prompt: "当用户输入连续事件并要求总结、判断异常或输出结构化结果时调用。输入可以是不严格文本；不要因为缺字段而放弃研判。"
     function_type: transform
-    involves_objects: [StationEvent, EventChain]
     params:
       event_text: {type: str, description: "用户输入的事件链原文"}
-      station_name: {type: str, description: "站点，可选", default: ""}
+      station_name: {type: str, description: "可选站点"}
 
-  analyze_event_chain:
-    summary: "分析运行事件链并判断是否异常"
-    description: "结合事件时间顺序、重叠关系、设备耦合、告警等级、是否自动恢复、是否出现保护动作/闭锁/功率异常等特征，给出事件链解释、主因假设、异常判断、置信度、需补充核查项和文档证据。"
-    usage_prompt: "用户问“发生了什么、是否异常、是不是正常操作伴随事件、要不要处理”时调用。分析必须先给时间线，再说明主导事件和伴随事件，最后给正常/可能正常/可疑/异常/证据不足判断。若只有告警消失、无保护出口、无闭锁、无功率失败，倾向于可能正常或需观察；若有保护动作、闭锁、功率升降未完成、告警持续/复现或关键设备异常，则提高异常等级。"
+  assess_substation_event_chain:
+    summary: "研判连续事件链并输出结构化结论"
+    description: "结合事件时间顺序、操作/保护/异常特征、告警等级和文档证据，在工具内完成事件链特征提取、证据匹配、触发条件匹配和初步结论生成。诊断依据以第五分册（设备异常与故障应急处理）为最高优先级，运行方式和控保规范用于补充说明。最终结果包含 answer_md、structured_conclusion、event_summary、feature_summary、observed_facts、abnormal_triggers、trigger_match、evidence_refs 和 evidence_summary；工具默认省略完整事件原文、case_context 和全文证据片段以降低长事件链上下文占用。trigger_match 的状态含义：matched=同类事实命中，related_but_not_matched=相关但不同类事实不能证明触发，not_matched=明确未命中，unknown=证据不足。"
+    usage_prompt: "当用户给出事件链并要求总结、判断是否异常、风险多大或输出结构化结论时，优先直接调用本工具；通常不要再逐步调用 build_substation_case_context、judge_substation_case 或 format_substation_conclusion。该工具结果已经是回答包，最终回答优先直接输出 answer_md，可少量压缩但不得重写 trigger_match 的状态和依据；不要为了查看中间过程反复调用 read_tool_result。不得复述工具调用过程、工具失败、自检过程或“已确认回复完整”。回答时不得把 related_but_not_matched 写成 matched，不得把控制响应差异、录波启动、短时复归告警跨类解释为分接头不一致、保护动作或设备停运。不要只凭控保设计规范或目录页给异常性结论，不要把文档中的异常场景反推为本次事件已发生。"
     function_type: analysis
-    involves_objects: [StationEvent, EventChain, EventInterpretation, HvdcDocument, DocumentChunk]
+    involves_objects: [StationEvent, EventChain, EventConclusion, SubstationDocument, EvidenceChunk]
     params:
-      events: {type: str, description: "结构化事件 JSON 或原始事件文本"}
-      evidence_query: {type: str, description: "证据检索关键词，可选", default: ""}
-      require_citations: {type: bool, description: "是否要求文档出处，默认 true", default: true}
+      event_text: {type: str, description: "用户输入的事件链原文", default: ""}
+      events_json: {type: str, description: "已解析事件 JSON，可选", default: ""}
+      evidence_query: {type: str, description: "额外证据检索关键词", default: ""}
+      limit_evidence: {type: int, description: "返回证据数量", default: 8}
 
-  find_relevant_procedures:
-    summary: "查找相关运行规程和异常处理预案"
-    description: "根据事件类型、设备、现象匹配典型操作票、运行方式规定、异常故障处理预案、控保设计规范和图册。"
-    usage_prompt: "当事件链中出现阀冷、保护动作、闭锁、功率升降异常、通信异常、录波启动等现象时使用。返回的是处置依据和需要核查的现场量。"
-    function_type: lookup
-    involves_objects: [EmergencyProcedure, OperationMode, HvdcDocument, DocumentChunk, DocumentFigure]
-    params:
-      phenomenon: {type: str, description: "现象或事件类型"}
-      device_name: {type: str, description: "设备或系统名称，可选", default: ""}
-      limit: {type: int, description: "返回数量，默认5", default: 5}
-
-  sync_substation_index:
-    summary: "同步换流站文档索引和事件模式KB"
-    description: "维护工具。扫描 domains/substation/docs_md 的 Markdown 和 assets，重建轻量 SQLite/FTS 索引、事件模式表和预案映射表。普通问答不需要调用；运行时索引缺失或源文件更新会自动同步。"
-    usage_prompt: "仅当用户明确要求刷新 substation 文档索引/KB，或新增、删除、替换 Markdown/图片后调用。不要在普通事件链问答中调用。"
+  build_substation_case_context:
+    summary: "构建事件链研判证据包"
+    description: "解析用户事件链，归一化主事件/伴随事件/异常信号，优先检索第五分册证据，再补充运行方式和控保规范，形成可供判定的 case_context。"
+    usage_prompt: "事件链研判的第一步。不要直接输出最终性质判断，先构建证据包。"
     user_visible: false
     function_type: lookup
-    involves_objects: [HvdcDocument, DocumentChunk, DocumentFigure]
+    involves_objects: [StationEvent, EventChain, SubstationDocument, EvidenceChunk]
+    params:
+      event_text: {type: str, description: "用户输入的事件链原文", default: ""}
+      events_json: {type: str, description: "已解析事件 JSON，可选", default: ""}
+      evidence_query: {type: str, description: "额外证据检索关键词", default: ""}
+      limit_evidence: {type: int, description: "返回证据数量", default: 8}
+
+  judge_substation_case:
+    summary: "根据证据包判定事件链"
+    description: "输入 case_context，基于事件特征与文档证据判定 event_type、event_nature、risk_level 和 reason，并输出 evidence_refs/evidence_summary 供追溯。"
+    usage_prompt: "事件链研判的第二步。只接受 build_substation_case_context 的输出，不要直接把原始事件文本塞进来。"
+    user_visible: false
+    function_type: analysis
+    involves_objects: [EventChain, EventConclusion, SubstationDocument, EvidenceChunk]
+    params:
+      case_context: {type: str, description: "build_substation_case_context 的 JSON 输出"}
+
+  format_substation_conclusion:
+    summary: "格式化并输出最终结论"
+    description: "把判定结果整理为标准结构化结论，并生成可持久化的 EventConclusion 记录。"
+    usage_prompt: "事件链研判的第三步。输出最终结构化数据，供前端展示或后续入库。"
+    user_visible: false
+    function_type: transform
+    involves_objects: [EventConclusion]
+    params:
+      judgment: {type: str, description: "judge_substation_case 的 JSON 输出"}
+
+  sync_substation_kb:
+    summary: "重建换流站证据索引"
+    description: "扫描 domains/substation/docs_md 下的 Markdown 文档，重建 SQLite 证据索引。"
+    usage_prompt: "仅在文档更新后维护索引用。"
+    user_visible: false
+    function_type: lookup
     params: {}
 
 workflows:
-  event_chain_triage:
-    description: "解析事件链 -> 归一化子系统 -> 检索规程/控保依据 -> 生成时间线 -> 判断主导事件和伴随事件 -> 输出异常等级、置信度和核查建议。"
-    trigger: "用户提供同站连续二级/三级事件、SER 或告警链并要求总结或判断异常"
-    involves_objects: [StationEvent, EventChain, EventInterpretation, HvdcDocument, DocumentChunk]
+  event_chain_judgement:
+    description: "解析事件链 -> 构建证据包 -> 基于证据包判定 -> 格式化结论"
+    trigger: "用户提供连续事件并要求总结、判断是否异常或输出结构化结论"
+    involves_objects: [StationEvent, EventChain, EventConclusion, SubstationDocument, EvidenceChunk]
     steps:
       - name: 解析事件链
-        function: parse_event_chain
-        description: "抽取事件时间、站点、设备、事件类型、摘要、等级，并归一化子系统。"
-        next: 检索文档依据
-      - name: 检索文档依据
-        function: search_substation_docs
-        description: "检索自动功率升降、阀冷、SER、录波、保护动作等相关规程和控保文档。"
-        next: 匹配处理预案
-      - name: 匹配处理预案
-        function: find_relevant_procedures
-        description: "查找相关运行规程、异常处理预案、运行方式规定和图册。"
-        next: 形成研判
-      - name: 形成研判
-        function: analyze_event_chain
-        description: "生成时间线、主导事件、伴随事件、异常判断、置信度和核查建议。"
+        function: parse_substation_events
+        description: "抽取事件列表和告警等级。"
+        next: 构建证据包
+      - name: 构建证据包
+        function: build_substation_case_context
+        description: "检索第五分册优先证据并补充支持材料。"
+        next: 证据判定
+      - name: 证据判定
+        function: judge_substation_case
+        description: "基于证据包形成事件性质与风险判断。"
+        next: 格式化结论
+      - name: 格式化结论
+        function: format_substation_conclusion
+        description: "生成结构化最终结论。"
         next: ""
 
 rules:
-  event_chain_answer_contract:
-    description: "事件链回答必须包含：时间线、主导事件、伴随事件、是否异常、判断依据、需补充核查项。"
-  evidence_separation:
-    description: "必须区分用户输入事实、文档依据和智能体推断。文档说明正常逻辑或处理原则，但不能替代实时功率、水温、保护出口和录波内容。"
-  conservative_abnormality:
-    description: "没有保护动作、闭锁、升降失败、告警持续或复现证据时，不应直接判为异常；应给出可能正常/伴随现象并列出核查项。"
+  fifth_volume_priority:
+    description: "设备异常与故障应急处理分册是诊断、异常性判断和处置建议的最高优先级知识源；控保设计规范、运行方式和设备概况只能作为补充。"
+    rule_type: judgment
+    applies_to: [EventConclusion, SubstationDocument, EvidenceChunk]
+    result_field: reason
+    source: internal
+
+  risk_vs_nature:
+    description: "event_nature 表示事件是否符合运行/保护逻辑，risk_level 表示潜在风险强度，两者可以不同。"
+    rule_type: judgment
+    applies_to: [EventConclusion, SubstationDocument, EvidenceChunk]
+    result_field: event_nature
+    source: internal
+
+  abnormality_threshold:
+    description: "出现保护动作、闭锁、跳闸、失败、停运、持续告警等后果时，性质倾向异常；仅有短时复归告警或操作伴随现象时，倾向需核查或正常。"
+    rule_type: judgment
+    applies_to: [SubstationDocument, EvidenceChunk]
+    result_field: risk_level
+    source: internal
